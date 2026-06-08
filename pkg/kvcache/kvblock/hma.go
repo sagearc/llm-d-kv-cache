@@ -52,6 +52,14 @@ func (c *GroupCatalog) Learn(podID string, g GroupID, meta GroupMetadata) {
 	c.entries[podID][g] = meta
 }
 
+// GroupCount returns the number of KV cache groups learned for podID.
+// Per-pod rather than global so a misconfigured pod does not raise the threshold for others.
+func (c *GroupCatalog) GroupCount(podID string) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries[podID])
+}
+
 // Get returns the metadata for a pod group.
 func (c *GroupCatalog) Get(podID string, g GroupID) (GroupMetadata, bool) {
 	c.mu.RLock()

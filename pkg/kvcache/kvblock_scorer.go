@@ -35,6 +35,10 @@ const (
 type KVBlockScorerConfig struct {
 	ScoringStrategy KVScoringStrategy
 	BackendConfigs  []*KVCacheBackendConfig `json:"backendConfigs"`
+
+	// GroupCatalog enables HMA-aware scoring. Must point to the same
+	// GroupCatalog that the kvevents.Pool populates at runtime.
+	GroupCatalog *kvblock.GroupCatalog `json:"-"`
 }
 
 // DefaultKVBlockScorerConfig returns the default configuration for the KVBlockScorer.
@@ -68,6 +72,7 @@ func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
 
 		return &LongestPrefixScorer{
 			MediumWeights: weightMap,
+			Catalog:       config.GroupCatalog,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported scoring strategy: %s", config.ScoringStrategy)
@@ -75,10 +80,11 @@ func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
 }
 
 // LongestPrefixScorer scores based on longest consecutive block matches count
-// starting from block 0.
+// starting from block 0. When Catalog is set, applies HMA-aware scoring.
 type LongestPrefixScorer struct {
 	// mediumWeights maps medium/device tier names to their scoring weights
 	MediumWeights map[string]float64
+	Catalog       *kvblock.GroupCatalog
 }
 
 // Strategy returns the strategy type: LongestPrefixMatch.
@@ -87,8 +93,9 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 }
 
 // fillMaxWeights populates dst with the maximum weight per podID across all
-// device tiers for the given entries. The caller must clear dst before calling.
-func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, mediumWeights map[string]float64) {
+// device tiers for the given entries, then removes any pod that does not have
+// all learned groups cached (HMA chain-break). The caller must clear dst before calling.
+func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, catalog *kvblock.GroupCatalog, mediumWeights map[string]float64) {
 	for _, entry := range entries {
 		weight := 1.0
 		if mediumWeights != nil {
@@ -98,6 +105,29 @@ func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, mediumWe
 		}
 		if cur, exists := dst[entry.PodIdentifier]; !exists || weight > cur {
 			dst[entry.PodIdentifier] = weight
+		}
+	}
+	if catalog == nil {
+		return
+	}
+	present := make(map[string]map[kvblock.GroupID]struct{})
+	for _, e := range entries {
+		if !e.HasGroup {
+			continue
+		}
+		if present[e.PodIdentifier] == nil {
+			present[e.PodIdentifier] = make(map[kvblock.GroupID]struct{})
+		}
+		present[e.PodIdentifier][e.GroupIdx] = struct{}{}
+	}
+	// Remove pods missing any group; non-HMA pods (no present entry) are kept.
+	for podID := range dst {
+		p := present[podID]
+		if len(p) == 0 {
+			continue
+		}
+		if expected := catalog.GroupCount(podID); expected > 0 && len(p) < expected {
+			delete(dst, podID)
 		}
 	}
 }
@@ -118,7 +148,7 @@ func (s *LongestPrefixScorer) Score(
 	curWeights := make(map[string]float64)
 
 	// Build weight index for the first key in a single pass over entries.
-	fillMaxWeights(curWeights, keyToPods[keys[0]], s.MediumWeights)
+	fillMaxWeights(curWeights, keyToPods[keys[0]], s.Catalog, s.MediumWeights)
 
 	// activePods tracks pods still in the consecutive prefix chain.
 	// Using a plain map and in-place deletion avoids allocating new sets
@@ -136,7 +166,7 @@ func (s *LongestPrefixScorer) Score(
 
 		// Reuse scratch map: clear and refill for current key.
 		clear(curWeights)
-		fillMaxWeights(curWeights, keyToPods[keys[i]], s.MediumWeights)
+		fillMaxWeights(curWeights, keyToPods[keys[i]], s.Catalog, s.MediumWeights)
 
 		// In-place intersection: delete pods from activePods that are not
 		// in the current key, and accumulate scores for those that remain.
