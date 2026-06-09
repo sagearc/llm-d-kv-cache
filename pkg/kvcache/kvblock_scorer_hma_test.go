@@ -25,27 +25,37 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// hmaCatalog builds a catalog modelling a full-attention + sliding-window
+// hybrid: group 0 is the main (full attention) group, group 1 is sliding
+// window. The window (32 tokens at block size 16) requires need =
+// cdiv(32-1, 16) = 2 contiguous trailing blocks for a sliding-window hit.
 func hmaCatalog(pods ...string) *kvblock.GroupCatalog {
 	c := kvblock.NewGroupCatalog()
+	window := 32
 	for _, pod := range pods {
 		c.Learn(pod, 0, kvblock.GroupMetadata{Kind: "full_attention", BlockSize: 16})
-		c.Learn(pod, 1, kvblock.GroupMetadata{Kind: "sliding_window", BlockSize: 16})
+		c.Learn(pod, 1, kvblock.GroupMetadata{Kind: "sliding_window", BlockSize: 16, SlidingWindowSize: &window})
 	}
 	return c
 }
 
-func hmaEntry(pod, tier string, groupIdx int) kvblock.PodEntry {
-	return kvblock.PodEntry{PodIdentifier: pod, DeviceTier: tier, HasGroup: true, GroupIdx: kvblock.GroupID(groupIdx)}
+func hmaEntry(pod string, groupIdx int) kvblock.PodEntry {
+	return kvblock.PodEntry{PodIdentifier: pod, DeviceTier: "gpu", HasGroup: true, GroupIdx: kvblock.GroupID(groupIdx)}
 }
 
 func hmaScorer(catalog *kvblock.GroupCatalog) *kvcache.LongestPrefixScorer {
 	return &kvcache.LongestPrefixScorer{
 		MediumWeights: map[string]float64{"gpu": 1.0, "cpu": 0.5},
 		Catalog:       catalog,
+		HashBlockSize: 16,
 	}
 }
 
-// TestHMAScoring verifies HMA group-aware scoring across key scenarios.
+// TestHMAScoring verifies HMA window-aware scoring: the main-attention group
+// (group 0) gates the contiguous prefix, and the sliding-window group (group 1)
+// reduces it to the longest prefix whose trailing window (need=2 blocks) is
+// present. This mirrors vLLM's hybrid cache-hit convergence to the minimum
+// across groups.
 func TestHMAScoring(t *testing.T) {
 	keys := int64KeysToKVBlockKeys([]uint64{1, 2, 3})
 
@@ -56,32 +66,71 @@ func TestHMAScoring(t *testing.T) {
 		want      map[string]float64
 	}{
 		{
-			name:    "full hit — both groups present",
+			name:    "full hit — main group present at every block",
 			catalog: hmaCatalog(podA),
 			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
-				1: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
-				2: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
-				3: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
+				1: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 			},
 			want: map[string]float64{podA: 3.0},
 		},
 		{
-			name:    "chain break — any group missing at first block",
+			// The whole SWA group is gone for this prefix, so vLLM's convergence
+			// to the per-group minimum yields no hit even though full attention
+			// is fully cached.
+			name:    "SWA group absent for prefix — converged hit collapses",
 			catalog: hmaCatalog(podA),
 			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
-				1: {hmaEntry(podA, "gpu", 1)},
-				2: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
-				3: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
+				1: {hmaEntry(podA, 0)},
+				2: {hmaEntry(podA, 0)},
+				3: {hmaEntry(podA, 0)},
 			},
 			want: map[string]float64{podA: 0.0},
 		},
 		{
-			name:    "chain breaks when any group goes missing mid-prefix",
+			// Full attention cached for all 3 blocks, but the SWA trailing block
+			// (block 2) was evicted. vLLM scans SWA right-to-left and the hit
+			// shrinks to the rightmost contiguous window (blocks 0..1).
+			name:    "SWA trailing window evicted — hit shrinks below full prefix",
 			catalog: hmaCatalog(podA),
 			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
-				1: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
-				2: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
-				3: {hmaEntry(podA, "gpu", 0)},
+				1: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				3: {hmaEntry(podA, 0)}, // SWA trailing block gone
+			},
+			want: map[string]float64{podA: 2.0},
+		},
+		{
+			// The early SWA block (block 0) is outside the window and was
+			// evicted, but the trailing window (blocks 1..2) is intact, so vLLM
+			// still gets a full-length hit. Early SWA presence is not required.
+			name:    "early SWA block evicted, trailing window intact — full hit",
+			catalog: hmaCatalog(podA),
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				1: {hmaEntry(podA, 0)}, // SWA early block gone (outside window)
+				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+			},
+			want: map[string]float64{podA: 3.0},
+		},
+		{
+			name:    "miss — only the SWA group present at the first block",
+			catalog: hmaCatalog(podA),
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				1: {hmaEntry(podA, 1)},
+				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+			},
+			want: map[string]float64{podA: 0.0},
+		},
+		{
+			name:    "chain breaks where the main group goes missing",
+			catalog: hmaCatalog(podA),
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				1: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				3: {hmaEntry(podA, 1)}, // main group absent -> prefix stops at block 2
 			},
 			want: map[string]float64{podA: 2.0},
 		},
@@ -94,6 +143,26 @@ func TestHMAScoring(t *testing.T) {
 				3: {{PodIdentifier: podA, DeviceTier: "gpu"}},
 			},
 			want: map[string]float64{podA: 3.0},
+		},
+		{
+			name:    "unlearned groups — group_idx 0 fallback treats group 0 as main",
+			catalog: kvblock.NewGroupCatalog(), // empty: nothing learned yet
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				1: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
+			},
+			want: map[string]float64{podA: 3.0},
+		},
+		{
+			name:    "nil catalog — group_idx 0 fallback still routes on group 0",
+			catalog: nil,
+			keyToPods: map[kvblock.BlockHash][]kvblock.PodEntry{
+				1: {hmaEntry(podA, 0)},
+				2: {hmaEntry(podA, 0)},
+				3: {hmaEntry(podA, 1)}, // non-zero group ignored under fallback
+			},
+			want: map[string]float64{podA: 2.0},
 		},
 	}
 
@@ -108,18 +177,19 @@ func TestHMAScoring(t *testing.T) {
 	}
 }
 
-// TestHMAScoring_TwoPods verifies chain independence between pods.
+// TestHMAScoring_TwoPods verifies chain independence between pods, scored on
+// the main-attention group only.
 func TestHMAScoring_TwoPods(t *testing.T) {
 	catalog := hmaCatalog(podA, podB)
 
 	keys := int64KeysToKVBlockKeys([]uint64{1, 2, 3})
 	keyToPods := map[kvblock.BlockHash][]kvblock.PodEntry{
 		1: {
-			hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1),
-			hmaEntry(podB, "gpu", 0), hmaEntry(podB, "gpu", 1),
+			hmaEntry(podA, 0), hmaEntry(podA, 1),
+			hmaEntry(podB, 0), hmaEntry(podB, 1),
 		},
-		2: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)}, // podB drops here
-		3: {hmaEntry(podA, "gpu", 0), hmaEntry(podA, "gpu", 1)},
+		2: {hmaEntry(podA, 0), hmaEntry(podA, 1)}, // podB drops here
+		3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 	}
 
 	scores, err := hmaScorer(catalog).Score(context.Background(), keys, keyToPods)
