@@ -35,10 +35,6 @@ const (
 type KVBlockScorerConfig struct {
 	ScoringStrategy KVScoringStrategy
 	BackendConfigs  []*KVCacheBackendConfig `json:"backendConfigs"`
-
-	// GroupCatalog enables HMA-aware scoring. Must point to the same
-	// GroupCatalog that the kvevents.Pool populates at runtime.
-	GroupCatalog *kvblock.GroupCatalog `json:"-"`
 }
 
 // DefaultKVBlockScorerConfig returns the default configuration for the KVBlockScorer.
@@ -61,7 +57,14 @@ type KVBlockScorer interface {
 }
 
 // NewKVBlockScorer creates a new KVBlockScorer based on the provided strategy.
-func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
+//
+// catalog enables HMA group-aware scoring; it must be the same instance the
+// kvevents.Pool learns into so the scorer reads the metadata the pool records.
+// It may be nil: HMA entries are then classified via the group_idx 0 fallback,
+// correct for the common case where vLLM assigns full attention to group 0.
+// hashBlockSize is the request-key block size in tokens (mirroring vLLM's
+// hash_block_size); when > 0 it enables precise sliding-window scoring.
+func NewKVBlockScorer(config *KVBlockScorerConfig, catalog *kvblock.GroupCatalog, hashBlockSize int) (KVBlockScorer, error) {
 	switch config.ScoringStrategy {
 	case LongestPrefixMatch:
 		// Build weight map from list of BackendConfigs for efficient lookup
@@ -72,7 +75,8 @@ func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
 
 		return &LongestPrefixScorer{
 			MediumWeights: weightMap,
-			Catalog:       config.GroupCatalog,
+			Catalog:       catalog,
+			HashBlockSize: hashBlockSize,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported scoring strategy: %s", config.ScoringStrategy)
@@ -80,11 +84,15 @@ func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
 }
 
 // LongestPrefixScorer scores based on longest consecutive block matches count
-// starting from block 0. When Catalog is set, applies HMA-aware scoring.
+// starting from block 0.
 type LongestPrefixScorer struct {
-	// mediumWeights maps medium/device tier names to their scoring weights
+	// MediumWeights maps medium/device tier names to their scoring weights.
 	MediumWeights map[string]float64
-	Catalog       *kvblock.GroupCatalog
+	// Catalog enables HMA group-aware scoring; may be nil (see NewKVBlockScorer).
+	Catalog *kvblock.GroupCatalog
+	// HashBlockSize is the request-key block size in tokens; when > 0 it enables
+	// precise sliding-window scoring (see NewKVBlockScorer).
+	HashBlockSize int
 }
 
 // Strategy returns the strategy type: LongestPrefixMatch.
@@ -92,47 +100,51 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 	return LongestPrefixMatch
 }
 
-// fillMaxWeights populates dst with the maximum weight per podID across all
-// device tiers for the given entries, then removes any pod that does not have
-// all learned groups cached (HMA chain-break). The caller must clear dst before calling.
-func fillMaxWeights(dst map[string]float64, entries []kvblock.PodEntry, catalog *kvblock.GroupCatalog, mediumWeights map[string]float64) {
-	for _, entry := range entries {
-		weight := 1.0
-		if mediumWeights != nil {
-			if w, exists := mediumWeights[entry.DeviceTier]; exists {
-				weight = w
-			}
-		}
-		if cur, exists := dst[entry.PodIdentifier]; !exists || weight > cur {
-			dst[entry.PodIdentifier] = weight
-		}
-	}
-	if catalog == nil {
-		return
-	}
-	present := make(map[string]map[kvblock.GroupID]struct{})
+// fillMainWeights populates dst with the maximum weight per pod across the
+// given block entries, counting only main-attention entries (full / MLA /
+// sink-full). These define the candidate prefix and carry its per-block weight.
+// The caller must clear dst before calling so it can be reused across blocks.
+//
+// vLLM emits one entry per KV cache group for HMA models. Sliding-window entries
+// are skipped here — they carry no prefix weight — but they are not ignored by
+// scoring overall: Score's phase 2 uses their presence to bound the hit length.
+// Mamba, chunked-local, and other kinds are not modeled. Non-HMA entries (no
+// group identity) always count, preserving legacy uniform-attention behavior.
+// Classification is via kvblock.GroupCatalog.IsMainGroup (nil-safe, with a
+// group_idx 0 fallback).
+func (s *LongestPrefixScorer) fillMainWeights(dst map[string]float64, entries []kvblock.PodEntry) {
 	for _, e := range entries {
-		if !e.HasGroup {
+		if e.HasGroup && !s.Catalog.IsMainGroup(e.PodIdentifier, e.GroupIdx) {
 			continue
 		}
-		if present[e.PodIdentifier] == nil {
-			present[e.PodIdentifier] = make(map[kvblock.GroupID]struct{})
+		weight := 1.0
+		if w, ok := s.MediumWeights[e.DeviceTier]; ok {
+			weight = w
 		}
-		present[e.PodIdentifier][e.GroupIdx] = struct{}{}
-	}
-	// Remove pods missing any group; non-HMA pods (no present entry) are kept.
-	for podID := range dst {
-		p := present[podID]
-		if len(p) == 0 {
-			continue
-		}
-		if expected := catalog.GroupCount(podID); expected > 0 && len(p) < expected {
-			delete(dst, podID)
+		if cur, ok := dst[e.PodIdentifier]; !ok || weight > cur {
+			dst[e.PodIdentifier] = weight
 		}
 	}
 }
 
 // Score implements the longest prefix scoring logic with weighted sum based on BackendConfig.
+//
+// Scoring mirrors vLLM's hybrid cache-hit convergence in two phases:
+//
+//  1. Main-attention prefix: the longest run of consecutive blocks from block 0
+//     for which the pod holds a main-attention entry (full / MLA / sink-full).
+//     Full attention is the binding constraint — it requires the entire prefix.
+//
+//  2. Sliding-window reduction: for each modeled sliding-window group, a hit
+//     needs only a trailing window of contiguous cached blocks, so a right-to-
+//     left scan finds the longest prefix whose trailing window is present. This
+//     can only shrink the main-attention prefix (the converged min), catching
+//     the case where a pod's SWA window for this prefix was evicted while its
+//     full-attention blocks survived. Early SWA blocks (outside the window) are
+//     not required, matching vLLM. SWA modeling is skipped when HashBlockSize
+//     is unset or a group cannot be modeled precisely, falling back to phase 1.
+//
+// The score is the tier-weighted sum over the converged hit length.
 func (s *LongestPrefixScorer) Score(
 	_ context.Context,
 	keys []kvblock.BlockHash,
@@ -142,21 +154,16 @@ func (s *LongestPrefixScorer) Score(
 		return make(map[string]float64), nil
 	}
 
-	podScores := make(map[string]float64)
-
-	// Scratch map reused across iterations to avoid per-key allocation.
-	curWeights := make(map[string]float64)
-
-	// Build weight index for the first key in a single pass over entries.
-	fillMaxWeights(curWeights, keyToPods[keys[0]], s.Catalog, s.MediumWeights)
-
-	// activePods tracks pods still in the consecutive prefix chain.
-	// Using a plain map and in-place deletion avoids allocating new sets
-	// on every iteration.
-	activePods := make(map[string]struct{}, len(curWeights))
-	for pod, w := range curWeights {
+	// Phase 1: per-pod main-attention prefix, recording the per-block weight so
+	// the prefix can be truncated to the converged hit length in phase 2.
+	// cur is a scratch map reused across blocks to avoid per-block allocation.
+	blockWeights := make(map[string][]float64)
+	cur := make(map[string]float64)
+	s.fillMainWeights(cur, keyToPods[keys[0]])
+	activePods := make(map[string]struct{}, len(cur))
+	for pod, w := range cur {
 		activePods[pod] = struct{}{}
-		podScores[pod] = w
+		blockWeights[pod] = []float64{w}
 	}
 
 	for i := 1; i < len(keys); i++ {
@@ -164,21 +171,79 @@ func (s *LongestPrefixScorer) Score(
 			break
 		}
 
-		// Reuse scratch map: clear and refill for current key.
-		clear(curWeights)
-		fillMaxWeights(curWeights, keyToPods[keys[i]], s.Catalog, s.MediumWeights)
+		clear(cur)
+		s.fillMainWeights(cur, keyToPods[keys[i]])
 
-		// In-place intersection: delete pods from activePods that are not
-		// in the current key, and accumulate scores for those that remain.
 		for pod := range activePods {
-			if w, exists := curWeights[pod]; exists {
-				podScores[pod] += w
+			if w, exists := cur[pod]; exists {
+				blockWeights[pod] = append(blockWeights[pod], w)
 			} else {
 				delete(activePods, pod)
 			}
 		}
 	}
 
-	// Return the map containing the final score for each pod encountered.
+	// Phase 2: reduce each pod's prefix by its sliding-window group coverage,
+	// then sum the per-block weights over the converged hit length.
+	podScores := make(map[string]float64, len(blockWeights))
+	for pod, weights := range blockWeights {
+		hit := len(weights)
+		if s.HashBlockSize > 0 {
+			// Shrink the hit to the longest prefix whose trailing window is
+			// present, per sliding-window group. Exact for the supported case
+			// of one modeled SWA group (homogeneous windows). Multiple
+			// heterogeneous SWA groups — deferred per issue #336 — would need a
+			// fixed-point re-check across groups (vLLM restarts on any shrink);
+			// this single pass could otherwise over-count for that case.
+			for _, g := range s.Catalog.SlidingWindowGroups(pod, s.HashBlockSize) {
+				if l := slidingWindowHitLen(pod, g, hit, keys, keyToPods); l < hit {
+					hit = l
+				}
+			}
+		}
+		var score float64
+		for i := 0; i < hit; i++ {
+			score += weights[i]
+		}
+		podScores[pod] = score
+	}
+
 	return podScores, nil
+}
+
+// slidingWindowHitLen returns the longest prefix length (in blocks, capped at
+// maxBlocks) for which pod has the contiguous trailing window required by the
+// sliding-window group g. It mirrors vLLM's SlidingWindowManager.find_longest_cache_hit:
+// scan right-to-left and stop once g.ContiguousBlocks blocks are contiguously
+// present; if the window never completes, the contiguous run anchored at block 0
+// still counts (a prefix shorter than the window).
+func slidingWindowHitLen(
+	pod string,
+	g kvblock.SlidingWindowGroup,
+	maxBlocks int,
+	keys []kvblock.BlockHash,
+	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
+) int {
+	contiguous := 0
+	for i := maxBlocks - 1; i >= 0; i-- {
+		if groupPresent(keyToPods[keys[i]], pod, g.GroupID) {
+			contiguous++
+			if contiguous >= g.ContiguousBlocks {
+				return i + contiguous
+			}
+		} else {
+			contiguous = 0
+		}
+	}
+	return contiguous
+}
+
+// groupPresent reports whether pod holds an entry for KV cache group g at this block.
+func groupPresent(entries []kvblock.PodEntry, pod string, g kvblock.GroupID) bool {
+	for _, e := range entries {
+		if e.PodIdentifier == pod && e.HasGroup && e.GroupIdx == g {
+			return true
+		}
+	}
+	return false
 }

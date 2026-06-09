@@ -14,8 +14,7 @@
 
 package kvevents
 
-// KVCacheSpecKind identifies vLLM KV cache group semantics.
-type KVCacheSpecKind string
+import "github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 
 // EventType represents the type of KV-cache event.
 type EventType string
@@ -27,19 +26,6 @@ const (
 	EventTypeBlockRemoved EventType = "BlockRemoved"
 	// EventTypeAllBlocksCleared indicates entire cache was cleared.
 	EventTypeAllBlocksCleared EventType = "AllBlocksCleared"
-)
-
-const (
-	KVCacheSpecKindFullAttention    KVCacheSpecKind = "full_attention"
-	KVCacheSpecKindMlaAttention     KVCacheSpecKind = "mla_attention"
-	KVCacheSpecKindSlidingWindow    KVCacheSpecKind = "sliding_window"
-	KVCacheSpecKindSlidingWindowMla KVCacheSpecKind = "sliding_window_mla"
-	KVCacheSpecKindMamba            KVCacheSpecKind = "mamba"
-	KVCacheSpecKindChunkedLocal     KVCacheSpecKind = "chunked_local_attention"
-	KVCacheSpecKindSinkFull         KVCacheSpecKind = "sink_full_attention"
-	KVCacheSpecKindEncoder          KVCacheSpecKind = "encoder_only_attention"
-	KVCacheSpecKindCross            KVCacheSpecKind = "cross_attention"
-	KVCacheSpecKindUnknown          KVCacheSpecKind = "unknown"
 )
 
 // GenericEvent represents a KV-cache event containing already-parsed data.
@@ -92,7 +78,7 @@ type BlockStoredEvent struct {
 	// GroupIdx identifies the vLLM KV cache group that emitted this event.
 	GroupIdx *int
 	// KVCacheSpecKind carries vLLM's semantic cache type for the group.
-	KVCacheSpecKind KVCacheSpecKind
+	KVCacheSpecKind kvblock.KVCacheSpecKind
 	// KVCacheSpecSlidingWindowSize carries the SWA window size when applicable.
 	KVCacheSpecSlidingWindowSize *int
 }

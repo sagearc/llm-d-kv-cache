@@ -98,11 +98,26 @@ type Pool struct {
 	wg             sync.WaitGroup
 }
 
+// PoolOption configures optional Pool behavior.
+type PoolOption func(*Pool)
+
+// WithGroupCatalog makes the pool learn HMA group metadata into the given
+// catalog. Pass the scorer's catalog (kvcache.Indexer.GroupCatalog) so metadata
+// learned from events reaches scoring. Without it, the pool keeps a private
+// catalog, which is harmless for non-HMA (uniform-attention) deployments.
+func WithGroupCatalog(catalog *kvblock.GroupCatalog) PoolOption {
+	return func(p *Pool) {
+		if catalog != nil {
+			p.groupCatalog = catalog
+		}
+	}
+}
+
 // NewPool creates a Pool with a sharded worker setup.
 // Subscribers are managed by SubscriberManager which is controlled by the pod
 // reconciler.
 func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProcessor,
-	adapter EngineAdapter,
+	adapter EngineAdapter, opts ...PoolOption,
 ) *Pool {
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -115,6 +130,9 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		tokenProcessor: tokenProcessor,
 		adapter:        adapter,
 		groupCatalog:   kvblock.NewGroupCatalog(),
+	}
+	for _, opt := range opts {
+		opt(p)
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -324,7 +342,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			if ev.GroupIdx != nil {
 				g := kvblock.GroupID(*ev.GroupIdx)
 				p.groupCatalog.Learn(podIdentifier, g, kvblock.GroupMetadata{
-					Kind:              string(ev.KVCacheSpecKind),
+					Kind:              ev.KVCacheSpecKind,
 					BlockSize:         ev.BlockSize,
 					SlidingWindowSize: ev.KVCacheSpecSlidingWindowSize,
 				})

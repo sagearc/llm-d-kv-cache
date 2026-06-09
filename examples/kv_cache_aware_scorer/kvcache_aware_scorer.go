@@ -117,7 +117,10 @@ func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePr
 		return nil, fmt.Errorf("failed to create engine adapter: %w", err)
 	}
 
-	pool := kvevents.NewPool(config.KVEventsConfig, kvCacheIndexer.KVBlockIndex(), tokenProcessor, adapter)
+	// Share one HMA group catalog: the indexer owns it (its scorer reads it),
+	// the pool learns group metadata from events into the same instance.
+	pool := kvevents.NewPool(config.KVEventsConfig, kvCacheIndexer.KVBlockIndex(), tokenProcessor, adapter,
+		kvevents.WithGroupCatalog(kvCacheIndexer.GroupCatalog()))
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)

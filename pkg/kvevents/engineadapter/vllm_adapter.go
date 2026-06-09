@@ -21,6 +21,7 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
+	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
 )
 
@@ -240,13 +241,13 @@ func (v *VLLMAdapter) convertBlockStoredEvent(fields []any) (kvevents.GenericEve
 		groupIdx = &group
 	}
 
-	var specKind kvevents.KVCacheSpecKind
+	var specKind kvblock.KVCacheSpecKind
 	if raw := fieldAt(fields, 10); raw != nil {
 		s, ok := raw.(string)
 		if !ok {
 			return nil, fmt.Errorf("BlockStored: kv_cache_spec_kind is not a string: %T", raw)
 		}
-		specKind = kvevents.KVCacheSpecKind(s)
+		specKind = kvblock.KVCacheSpecKind(s)
 	}
 
 	var slidingWindow *int

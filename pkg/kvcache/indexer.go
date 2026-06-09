@@ -68,6 +68,7 @@ type Indexer struct {
 	tokenProcessor kvblock.TokenProcessor // turns tokens to kv block keys
 	kvBlockIndex   kvblock.Index          // looks up pods for block keys
 	kvBlockScorer  KVBlockScorer          // scores pods based on block hits
+	groupCatalog   *kvblock.GroupCatalog  // per-pod HMA group metadata, learned from events
 
 	tokenizersPool TokenizersPool
 }
@@ -75,6 +76,10 @@ type Indexer struct {
 // NewKVCacheIndexer creates a KVCacheIndex given a Config. When
 // config.TokenizersPoolConfig is nil, the indexer accepts only the tokens-in
 // API (Indexer.ScoreTokens) and the prompt-string entry points return an error.
+//
+// The indexer owns the HMA group catalog its scorer reads from. To enable
+// group-aware scoring, bridge it to the kvevents.Pool (the writer) via
+// Indexer.GroupCatalog, mirroring how Indexer.KVBlockIndex is bridged.
 func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblock.TokenProcessor) (*Indexer, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
@@ -94,7 +99,10 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 
 	// override backend configs with the ones from the config, if the defaults are not used.
 	config.KVBlockScorerConfig.BackendConfigs = config.BackendConfigs
-	scorer, err := NewKVBlockScorer(config.KVBlockScorerConfig)
+	// The catalog the pool learns into and the scorer reads; the request-key
+	// block size lets the scorer model sliding-window groups (see NewKVBlockScorer).
+	groupCatalog := kvblock.NewGroupCatalog()
+	scorer, err := NewKVBlockScorer(config.KVBlockScorerConfig, groupCatalog, tokenProcessor.BlockSize())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
 	}
@@ -108,6 +116,7 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 		tokenProcessor: tokenProcessor,
 		kvBlockIndex:   kvBlockIndex,
 		kvBlockScorer:  scorer,
+		groupCatalog:   groupCatalog,
 	}
 
 	if config.TokenizersPoolConfig != nil {
@@ -133,6 +142,13 @@ func (k *Indexer) Run(ctx context.Context) {
 // KVBlockIndex returns the kvblock.Index used by the Indexer.
 func (k *Indexer) KVBlockIndex() kvblock.Index {
 	return k.kvBlockIndex
+}
+
+// GroupCatalog returns the HMA group catalog the Indexer's scorer reads from.
+// Pass it to kvevents.NewPool so the pool learns group metadata into the same
+// instance the scorer consults.
+func (k *Indexer) GroupCatalog() *kvblock.GroupCatalog {
+	return k.groupCatalog
 }
 
 // ErrInternalTokenizationDisabled is returned by the deprecated prompt-string
