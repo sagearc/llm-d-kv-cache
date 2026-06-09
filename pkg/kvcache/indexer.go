@@ -100,18 +100,20 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
 	}
+	// Keep the concrete HMA scorer (nil for other strategies) so SetGroupCatalog
+	// can wire the pool's catalog into it.
+	prefixScorer, _ := scorer.(*LongestPrefixScorer)
+
+	// Wrap scorer with tracing instrumentation.
+	// When tracing is not configured, otel.Tracer() returns a no-op implementation.
+	scorer = NewTracedScorer(scorer)
 
 	indexer := &Indexer{
 		config:         config,
 		tokenProcessor: tokenProcessor,
 		kvBlockIndex:   kvBlockIndex,
-		// Wrap scorer with tracing instrumentation. When tracing is not
-		// configured, otel.Tracer() returns a no-op implementation.
-		kvBlockScorer: NewTracedScorer(scorer),
-	}
-	// Keep the concrete HMA scorer so SetGroupCatalog can wire the pool's catalog.
-	if lps, ok := scorer.(*LongestPrefixScorer); ok {
-		indexer.prefixScorer = lps
+		kvBlockScorer:  scorer,
+		prefixScorer:   prefixScorer,
 	}
 
 	if config.TokenizersPoolConfig != nil {

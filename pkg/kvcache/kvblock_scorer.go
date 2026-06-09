@@ -115,8 +115,8 @@ func (s *LongestPrefixScorer) fillMainWeights(dst map[string]float64, entries []
 			continue
 		}
 		weight := 1.0
-		if mediumWeights := s.MediumWeights; mediumWeights != nil {
-			if w, exists := mediumWeights[entry.DeviceTier]; exists {
+		if s.MediumWeights != nil {
+			if w, exists := s.MediumWeights[entry.DeviceTier]; exists {
 				weight = w
 			}
 		}
@@ -155,12 +155,14 @@ func (s *LongestPrefixScorer) Score(
 
 	// Phase 1: per-pod main-attention prefix, recording the per-block weight so
 	// the prefix can be truncated to the converged hit length in phase 2.
-	// cur is a scratch map reused across blocks to avoid per-block allocation.
 	blockWeights := make(map[string][]float64)
-	cur := make(map[string]float64)
-	s.fillMainWeights(cur, keyToPods[keys[0]])
-	activePods := make(map[string]struct{}, len(cur))
-	for pod, w := range cur {
+
+	// Scratch map reused across iterations to avoid per-key allocation.
+	curWeights := make(map[string]float64)
+	s.fillMainWeights(curWeights, keyToPods[keys[0]])
+
+	activePods := make(map[string]struct{}, len(curWeights))
+	for pod, w := range curWeights {
 		activePods[pod] = struct{}{}
 		blockWeights[pod] = []float64{w}
 	}
@@ -170,11 +172,11 @@ func (s *LongestPrefixScorer) Score(
 			break
 		}
 
-		clear(cur)
-		s.fillMainWeights(cur, keyToPods[keys[i]])
+		clear(curWeights)
+		s.fillMainWeights(curWeights, keyToPods[keys[i]])
 
 		for pod := range activePods {
-			if w, exists := cur[pod]; exists {
+			if w, exists := curWeights[pod]; exists {
 				blockWeights[pod] = append(blockWeights[pod], w)
 			} else {
 				delete(activePods, pod)
