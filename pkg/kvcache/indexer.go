@@ -102,7 +102,10 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 	}
 	// Keep the concrete HMA scorer (nil for other strategies) so SetGroupCatalog
 	// can wire the pool's catalog into it.
-	prefixScorer, _ := scorer.(*LongestPrefixScorer)
+	var prefixScorer *LongestPrefixScorer
+	if lps, ok := scorer.(*LongestPrefixScorer); ok {
+		prefixScorer = lps
+	}
 
 	// Wrap scorer with tracing instrumentation.
 	// When tracing is not configured, otel.Tracer() returns a no-op implementation.
