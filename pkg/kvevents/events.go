@@ -23,6 +23,18 @@ package kvevents
 // constants are needed for them.
 type KVCacheSpecKind string
 
+// EventType represents the type of KV-cache event.
+type EventType string
+
+const (
+	// EventTypeBlockStored indicates blocks were added to cache.
+	EventTypeBlockStored EventType = "BlockStored"
+	// EventTypeBlockRemoved indicates blocks were evicted from cache.
+	EventTypeBlockRemoved EventType = "BlockRemoved"
+	// EventTypeAllBlocksCleared indicates entire cache was cleared.
+	EventTypeAllBlocksCleared EventType = "AllBlocksCleared"
+)
+
 const (
 	KVCacheSpecKindFullAttention     KVCacheSpecKind = "full_attention"
 	KVCacheSpecKindMLAAttention      KVCacheSpecKind = "mla_attention"
@@ -51,18 +63,6 @@ func (k KVCacheSpecKind) IsMainAttention() bool {
 func (k KVCacheSpecKind) IsSlidingWindow() bool {
 	return k == KVCacheSpecKindSlidingWindow || k == KVCacheSpecKindSlidingWindowMLA
 }
-
-// EventType represents the type of KV-cache event.
-type EventType string
-
-const (
-	// EventTypeBlockStored indicates blocks were added to cache.
-	EventTypeBlockStored EventType = "BlockStored"
-	// EventTypeBlockRemoved indicates blocks were evicted from cache.
-	EventTypeBlockRemoved EventType = "BlockRemoved"
-	// EventTypeAllBlocksCleared indicates entire cache was cleared.
-	EventTypeAllBlocksCleared EventType = "AllBlocksCleared"
-)
 
 // GenericEvent represents a KV-cache event containing already-parsed data.
 type GenericEvent interface {

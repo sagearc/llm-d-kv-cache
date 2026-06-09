@@ -110,16 +110,18 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 // Classification is via kvblock.GroupCatalog.IsMainGroup (nil-safe, with a
 // group_idx 0 fallback).
 func (s *LongestPrefixScorer) fillMainWeights(dst map[string]float64, entries []kvblock.PodEntry) {
-	for _, e := range entries {
-		if e.HasGroup && !s.Catalog.IsMainGroup(e.PodIdentifier, e.GroupIdx) {
+	for _, entry := range entries {
+		if entry.HasGroup && !s.Catalog.IsMainGroup(entry.PodIdentifier, entry.GroupIdx) {
 			continue
 		}
 		weight := 1.0
-		if w, ok := s.MediumWeights[e.DeviceTier]; ok {
-			weight = w
+		if mediumWeights := s.MediumWeights; mediumWeights != nil {
+			if w, exists := mediumWeights[entry.DeviceTier]; exists {
+				weight = w
+			}
 		}
-		if cur, ok := dst[e.PodIdentifier]; !ok || weight > cur {
-			dst[e.PodIdentifier] = weight
+		if cur, exists := dst[entry.PodIdentifier]; !exists || weight > cur {
+			dst[entry.PodIdentifier] = weight
 		}
 	}
 }
