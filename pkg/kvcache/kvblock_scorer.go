@@ -60,7 +60,7 @@ type KVBlockScorer interface {
 //
 // To enable HMA group-aware scoring, wire the kvevents.Pool's catalog via
 // SetGroupCatalog.
-func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
+func NewKVBlockScorer(config *KVBlockScorerConfig) (*LongestPrefixScorer, error) {
 	switch config.ScoringStrategy {
 	case LongestPrefixMatch:
 		// Build weight map from list of BackendConfigs for efficient lookup

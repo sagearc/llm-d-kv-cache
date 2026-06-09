@@ -95,17 +95,16 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 
 	// override backend configs with the ones from the config, if the defaults are not used.
 	config.KVBlockScorerConfig.BackendConfigs = config.BackendConfigs
-	scorer, err := NewKVBlockScorer(config.KVBlockScorerConfig)
+	// Keep the concrete scorer for SetGroupCatalog wiring; tracing wraps it
+	// behind the KVBlockScorer interface for the scoring path.
+	prefixScorer, err := NewKVBlockScorer(config.KVBlockScorerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
 	}
-	// Keep the concrete scorer so SetGroupCatalog can wire the pool's catalog
-	// into it, before tracing wraps it behind the interface.
-	prefixScorer := scorer.(*LongestPrefixScorer)
 
 	// Wrap scorer with tracing instrumentation.
 	// When tracing is not configured, otel.Tracer() returns a no-op implementation.
-	scorer = NewTracedScorer(scorer)
+	scorer := NewTracedScorer(prefixScorer)
 
 	indexer := &Indexer{
 		config:         config,
