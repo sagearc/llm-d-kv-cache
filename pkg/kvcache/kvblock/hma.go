@@ -87,18 +87,21 @@ type SlidingWindowGroup struct {
 	ContiguousBlocks int
 }
 
-// SlidingWindowGroups returns the sliding-window groups for podID that can be
-// modeled at the given hashBlockSize (the request-key block size, mirroring
-// vLLM's hash_block_size).
+// SlidingWindowGroups returns the sliding-window groups for podID, with the
+// contiguous trailing-block count each needs for a hit.
 //
-// A group qualifies only when (1) it is a sliding-window group (SlidingWindowSize
-// set), (2) its block size equals hashBlockSize so its blocks align 1:1 with
-// request keys — the router indexes a single hash block size and cannot
-// reconstruct a differently-sized group's blocks — and (3) its window is large
-// enough to require at least one trailing block. Groups that cannot be modeled
-// precisely are omitted, so the caller simply does not use them to shrink the
-// hit — never under-counting.
-func (c *GroupCatalog) SlidingWindowGroups(podID string, hashBlockSize int) []SlidingWindowGroup {
+// The count is cdiv(window-1, blockSize) using the group's own block size —
+// mirroring vLLM's SlidingWindowManager._contiguous_blocks_for_hit, which
+// divides by the group's spec block size. This assumes the router indexes at
+// that block size, which holds for uniform-block-size models; differing-block-
+// size hybrids (e.g. Gemma) are unsupported at the indexing layer (the single
+// request-key granularity cannot match a differently-sized group's blocks) and
+// are deferred (#336).
+//
+// A group qualifies only when it is a sliding-window group (SlidingWindowSize
+// set) with a known block size and a window large enough to require at least one
+// trailing block.
+func (c *GroupCatalog) SlidingWindowGroups(podID string) []SlidingWindowGroup {
 	if c == nil {
 		return nil
 	}
@@ -108,10 +111,10 @@ func (c *GroupCatalog) SlidingWindowGroups(podID string, hashBlockSize int) []Sl
 
 	var groups []SlidingWindowGroup
 	for g, meta := range c.entries[podID] {
-		if meta.SlidingWindowSize == nil || meta.BlockSize != hashBlockSize {
+		if meta.SlidingWindowSize == nil || meta.BlockSize <= 0 {
 			continue
 		}
-		need := cdiv(*meta.SlidingWindowSize-1, hashBlockSize)
+		need := cdiv(*meta.SlidingWindowSize-1, meta.BlockSize)
 		if need <= 0 {
 			continue
 		}

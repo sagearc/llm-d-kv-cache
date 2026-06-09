@@ -47,7 +47,6 @@ func hmaScorer(catalog *kvblock.GroupCatalog) *kvcache.LongestPrefixScorer {
 	return &kvcache.LongestPrefixScorer{
 		MediumWeights: map[string]float64{"gpu": 1.0, "cpu": 0.5},
 		Catalog:       catalog,
-		HashBlockSize: 16,
 	}
 }
 

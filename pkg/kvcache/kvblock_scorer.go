@@ -58,10 +58,9 @@ type KVBlockScorer interface {
 
 // NewKVBlockScorer creates a new KVBlockScorer based on the provided strategy.
 //
-// hashBlockSize is the request-key block size in tokens (mirroring vLLM's
-// hash_block_size); when > 0 it enables precise sliding-window scoring. To enable
-// HMA group-aware scoring, wire the kvevents.Pool's catalog via SetGroupCatalog.
-func NewKVBlockScorer(config *KVBlockScorerConfig, hashBlockSize int) (KVBlockScorer, error) {
+// To enable HMA group-aware scoring, wire the kvevents.Pool's catalog via
+// SetGroupCatalog.
+func NewKVBlockScorer(config *KVBlockScorerConfig) (KVBlockScorer, error) {
 	switch config.ScoringStrategy {
 	case LongestPrefixMatch:
 		// Build weight map from list of BackendConfigs for efficient lookup
@@ -72,7 +71,6 @@ func NewKVBlockScorer(config *KVBlockScorerConfig, hashBlockSize int) (KVBlockSc
 
 		return &LongestPrefixScorer{
 			MediumWeights: weightMap,
-			HashBlockSize: hashBlockSize,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported scoring strategy: %s", config.ScoringStrategy)
@@ -87,9 +85,6 @@ type LongestPrefixScorer struct {
 	// Catalog enables HMA group-aware scoring; may be nil (uniform attention).
 	// Wired post-construction from the kvevents.Pool via Indexer.SetGroupCatalog.
 	Catalog *kvblock.GroupCatalog
-	// HashBlockSize is the request-key block size in tokens; when > 0 it enables
-	// precise sliding-window scoring (see NewKVBlockScorer).
-	HashBlockSize int
 }
 
 // Strategy returns the strategy type: LongestPrefixMatch.
@@ -140,8 +135,8 @@ func (s *LongestPrefixScorer) fillMainWeights(dst map[string]float64, entries []
 //     can only shrink the main-attention prefix (the converged min), catching
 //     the case where a pod's SWA window for this prefix was evicted while its
 //     full-attention blocks survived. Early SWA blocks (outside the window) are
-//     not required, matching vLLM. SWA modeling is skipped when HashBlockSize
-//     is unset or a group cannot be modeled precisely, falling back to phase 1.
+//     not required, matching vLLM. With no catalog (or no modeled sliding-window
+//     group) phase 2 is a no-op and the score is the phase-1 prefix.
 //
 // The score is the tier-weighted sum over the converged hit length.
 func (s *LongestPrefixScorer) Score(
@@ -189,17 +184,15 @@ func (s *LongestPrefixScorer) Score(
 	podScores := make(map[string]float64, len(blockWeights))
 	for pod, weights := range blockWeights {
 		hit := len(weights)
-		if s.HashBlockSize > 0 {
-			// Shrink the hit to the longest prefix whose trailing window is
-			// present, per sliding-window group. Exact for the supported case
-			// of one modeled SWA group (homogeneous windows). Multiple
-			// heterogeneous SWA groups — deferred per issue #336 — would need a
-			// fixed-point re-check across groups (vLLM restarts on any shrink);
-			// this single pass could otherwise over-count for that case.
-			for _, g := range s.Catalog.SlidingWindowGroups(pod, s.HashBlockSize) {
-				if l := slidingWindowHitLen(pod, g, hit, keys, keyToPods); l < hit {
-					hit = l
-				}
+		// Shrink the hit to the longest prefix whose trailing window is present,
+		// per sliding-window group. Exact for the supported case of one modeled
+		// SWA group (homogeneous windows). Multiple heterogeneous SWA groups —
+		// deferred per issue #336 — would need a fixed-point re-check across
+		// groups (vLLM restarts on any shrink); this single pass could otherwise
+		// over-count for that case. A nil catalog yields no groups (no-op).
+		for _, g := range s.Catalog.SlidingWindowGroups(pod) {
+			if l := slidingWindowHitLen(pod, g, hit, keys, keyToPods); l < hit {
+				hit = l
 			}
 		}
 		var score float64

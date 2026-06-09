@@ -68,7 +68,7 @@ type Indexer struct {
 	tokenProcessor kvblock.TokenProcessor // turns tokens to kv block keys
 	kvBlockIndex   kvblock.Index          // looks up pods for block keys
 	kvBlockScorer  KVBlockScorer          // scores pods based on block hits
-	prefixScorer   *LongestPrefixScorer   // HMA-aware scorer, nil for other strategies
+	prefixScorer   *LongestPrefixScorer   // concrete scorer, for SetGroupCatalog wiring
 
 	tokenizersPool TokenizersPool
 }
@@ -95,17 +95,13 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 
 	// override backend configs with the ones from the config, if the defaults are not used.
 	config.KVBlockScorerConfig.BackendConfigs = config.BackendConfigs
-	// The request-key block size lets the scorer model sliding-window groups (see NewKVBlockScorer).
-	scorer, err := NewKVBlockScorer(config.KVBlockScorerConfig, tokenProcessor.BlockSize())
+	scorer, err := NewKVBlockScorer(config.KVBlockScorerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
 	}
-	// Keep the concrete HMA scorer (nil for other strategies) so SetGroupCatalog
-	// can wire the pool's catalog into it.
-	var prefixScorer *LongestPrefixScorer
-	if lps, ok := scorer.(*LongestPrefixScorer); ok {
-		prefixScorer = lps
-	}
+	// Keep the concrete scorer so SetGroupCatalog can wire the pool's catalog
+	// into it, before tracing wraps it behind the interface.
+	prefixScorer := scorer.(*LongestPrefixScorer)
 
 	// Wrap scorer with tracing instrumentation.
 	// When tracing is not configured, otel.Tracer() returns a no-op implementation.
@@ -146,7 +142,8 @@ func (k *Indexer) KVBlockIndex() kvblock.Index {
 
 // SetGroupCatalog points the scorer at the kvevents.Pool's HMA group catalog so
 // group metadata learned from events reaches scoring. Pass pool.GroupCatalog()
-// after constructing the pool. A no-op for non-HMA scoring strategies.
+// after constructing the pool. A no-op when the indexer has no concrete prefix
+// scorer (e.g. one built via NewIndexerForTest).
 func (k *Indexer) SetGroupCatalog(catalog *kvblock.GroupCatalog) {
 	if k.prefixScorer != nil {
 		k.prefixScorer.Catalog = catalog
