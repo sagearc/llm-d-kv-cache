@@ -98,26 +98,11 @@ type Pool struct {
 	wg             sync.WaitGroup
 }
 
-// PoolOption configures optional Pool behavior.
-type PoolOption func(*Pool)
-
-// WithGroupCatalog makes the pool learn HMA group metadata into the given
-// catalog. Pass the scorer's catalog (kvcache.Indexer.GroupCatalog) so metadata
-// learned from events reaches scoring. Without it, the pool keeps a private
-// catalog, which is harmless for non-HMA (uniform-attention) deployments.
-func WithGroupCatalog(catalog *kvblock.GroupCatalog) PoolOption {
-	return func(p *Pool) {
-		if catalog != nil {
-			p.groupCatalog = catalog
-		}
-	}
-}
-
 // NewPool creates a Pool with a sharded worker setup.
 // Subscribers are managed by SubscriberManager which is controlled by the pod
 // reconciler.
 func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProcessor,
-	adapter EngineAdapter, opts ...PoolOption,
+	adapter EngineAdapter,
 ) *Pool {
 	if cfg == nil {
 		cfg = DefaultConfig()
@@ -130,9 +115,6 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 		tokenProcessor: tokenProcessor,
 		adapter:        adapter,
 		groupCatalog:   kvblock.NewGroupCatalog(),
-	}
-	for _, opt := range opts {
-		opt(p)
 	}
 
 	for i := 0; i < p.concurrency; i++ {
@@ -341,11 +323,16 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
 			if ev.GroupIdx != nil {
 				g := kvblock.GroupID(*ev.GroupIdx)
-				p.groupCatalog.Learn(podIdentifier, g, kvblock.GroupMetadata{
-					Kind:              ev.KVCacheSpecKind,
-					BlockSize:         ev.BlockSize,
-					SlidingWindowSize: ev.KVCacheSpecSlidingWindowSize,
-				})
+				// Classify the vLLM cache-spec kind into engine-agnostic group
+				// properties; the window is only meaningful for sliding-window groups.
+				meta := kvblock.GroupMetadata{
+					IsMainAttention: ev.KVCacheSpecKind.IsMainAttention(),
+					BlockSize:       ev.BlockSize,
+				}
+				if ev.KVCacheSpecKind.IsSlidingWindow() {
+					meta.SlidingWindowSize = ev.KVCacheSpecSlidingWindowSize
+				}
+				p.groupCatalog.Learn(podIdentifier, g, meta)
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = g
 			}

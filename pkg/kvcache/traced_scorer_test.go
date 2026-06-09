@@ -28,7 +28,7 @@ import (
 func TestNewTracedScorer(t *testing.T) {
 	// Create a base scorer
 	config := kvcache.DefaultKVBlockScorerConfig()
-	baseScorer, err := kvcache.NewKVBlockScorer(config, nil, 0)
+	baseScorer, err := kvcache.NewKVBlockScorer(config, 0)
 	require.NoError(t, err)
 
 	// Wrap it with tracing
@@ -39,7 +39,7 @@ func TestNewTracedScorer(t *testing.T) {
 func TestTracedScorerBehavior(t *testing.T) {
 	// Create a base scorer
 	config := kvcache.DefaultKVBlockScorerConfig()
-	baseScorer, err := kvcache.NewKVBlockScorer(config, nil, 0)
+	baseScorer, err := kvcache.NewKVBlockScorer(config, 0)
 	require.NoError(t, err)
 
 	// Wrap it with tracing
@@ -79,7 +79,7 @@ func TestTracedScorerBehavior(t *testing.T) {
 
 func TestTracedScorerWithEmptyData(t *testing.T) {
 	config := kvcache.DefaultKVBlockScorerConfig()
-	baseScorer, err := kvcache.NewKVBlockScorer(config, nil, 0)
+	baseScorer, err := kvcache.NewKVBlockScorer(config, 0)
 	require.NoError(t, err)
 
 	tracedScorer := kvcache.NewTracedScorer(baseScorer)
@@ -92,7 +92,7 @@ func TestTracedScorerWithEmptyData(t *testing.T) {
 
 func TestTracedScorerScoreDistribution(t *testing.T) {
 	config := kvcache.DefaultKVBlockScorerConfig()
-	baseScorer, err := kvcache.NewKVBlockScorer(config, nil, 0)
+	baseScorer, err := kvcache.NewKVBlockScorer(config, 0)
 	require.NoError(t, err)
 
 	tracedScorer := kvcache.NewTracedScorer(baseScorer)

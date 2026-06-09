@@ -88,7 +88,7 @@ func newTestIndexer(t *testing.T, tp kvblock.TokenProcessor, pool kvcache.Tokeni
 	idx, err := kvblock.NewInMemoryIndex(kvblock.DefaultInMemoryIndexConfig())
 	require.NoError(t, err)
 
-	scorer, err := kvcache.NewKVBlockScorer(kvcache.DefaultKVBlockScorerConfig(), nil, 0)
+	scorer, err := kvcache.NewKVBlockScorer(kvcache.DefaultKVBlockScorerConfig(), 0)
 	require.NoError(t, err)
 
 	return kvcache.NewIndexerForTest(tp, idx, scorer, pool)

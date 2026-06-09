@@ -58,13 +58,10 @@ type KVBlockScorer interface {
 
 // NewKVBlockScorer creates a new KVBlockScorer based on the provided strategy.
 //
-// catalog enables HMA group-aware scoring; it must be the same instance the
-// kvevents.Pool learns into so the scorer reads the metadata the pool records.
-// It may be nil: HMA entries are then classified via the group_idx 0 fallback,
-// correct for the common case where vLLM assigns full attention to group 0.
 // hashBlockSize is the request-key block size in tokens (mirroring vLLM's
-// hash_block_size); when > 0 it enables precise sliding-window scoring.
-func NewKVBlockScorer(config *KVBlockScorerConfig, catalog *kvblock.GroupCatalog, hashBlockSize int) (KVBlockScorer, error) {
+// hash_block_size); when > 0 it enables precise sliding-window scoring. To enable
+// HMA group-aware scoring, wire the kvevents.Pool's catalog via SetGroupCatalog.
+func NewKVBlockScorer(config *KVBlockScorerConfig, hashBlockSize int) (KVBlockScorer, error) {
 	switch config.ScoringStrategy {
 	case LongestPrefixMatch:
 		// Build weight map from list of BackendConfigs for efficient lookup
@@ -75,7 +72,6 @@ func NewKVBlockScorer(config *KVBlockScorerConfig, catalog *kvblock.GroupCatalog
 
 		return &LongestPrefixScorer{
 			MediumWeights: weightMap,
-			Catalog:       catalog,
 			HashBlockSize: hashBlockSize,
 		}, nil
 	default:
@@ -88,7 +84,8 @@ func NewKVBlockScorer(config *KVBlockScorerConfig, catalog *kvblock.GroupCatalog
 type LongestPrefixScorer struct {
 	// MediumWeights maps medium/device tier names to their scoring weights.
 	MediumWeights map[string]float64
-	// Catalog enables HMA group-aware scoring; may be nil (see NewKVBlockScorer).
+	// Catalog enables HMA group-aware scoring; may be nil (uniform attention).
+	// Wired post-construction from the kvevents.Pool via Indexer.SetGroupCatalog.
 	Catalog *kvblock.GroupCatalog
 	// HashBlockSize is the request-key block size in tokens; when > 0 it enables
 	// precise sliding-window scoring (see NewKVBlockScorer).

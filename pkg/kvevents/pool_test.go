@@ -669,7 +669,7 @@ func TestHMAGroupMetadataAndEntryOnBlockStored(t *testing.T) {
 				Tokens:                       tokens,
 				ParentHash:                   0,
 				GroupIdx:                     &groupIdx,
-				KVCacheSpecKind:              kvblock.KVCacheSpecKindSlidingWindow,
+				KVCacheSpecKind:              KVCacheSpecKindSlidingWindow,
 				KVCacheSpecSlidingWindowSize: &slidingWindow,
 				BlockSize:                    16,
 			},
@@ -679,7 +679,7 @@ func TestHMAGroupMetadataAndEntryOnBlockStored(t *testing.T) {
 
 	meta, ok := pool.GroupCatalog().Get("pod-hma", kvblock.GroupID(0))
 	require.True(t, ok)
-	assert.Equal(t, kvblock.KVCacheSpecKindSlidingWindow, meta.Kind)
+	assert.False(t, meta.IsMainAttention, "sliding-window group is not main attention")
 	assert.Equal(t, 16, meta.BlockSize)
 	require.NotNil(t, meta.SlidingWindowSize)
 	assert.Equal(t, 128, *meta.SlidingWindowSize)
@@ -717,7 +717,7 @@ func TestHMAGroupLevelEviction_BlockRemoved(t *testing.T) {
 					Tokens:          tokens,
 					ParentHash:      0,
 					GroupIdx:        &gIdx,
-					KVCacheSpecKind: kvblock.KVCacheSpecKindFullAttention,
+					KVCacheSpecKind: KVCacheSpecKindFullAttention,
 					BlockSize:       16,
 				},
 			},

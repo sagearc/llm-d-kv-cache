@@ -19,7 +19,6 @@ package engineadapter //nolint:testpackage // Tests access unexported functions
 import (
 	"testing"
 
-	"github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-kv-cache/pkg/kvevents"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -188,7 +187,7 @@ func TestVLLMBlockStoredWithHMAMetadata(t *testing.T) {
 	assert.Equal(t, 16, blockStored.BlockSize)
 	require.NotNil(t, blockStored.GroupIdx)
 	assert.Equal(t, 1, *blockStored.GroupIdx)
-	assert.Equal(t, kvblock.KVCacheSpecKindSlidingWindow, blockStored.KVCacheSpecKind)
+	assert.Equal(t, kvevents.KVCacheSpecKindSlidingWindow, blockStored.KVCacheSpecKind)
 	require.NotNil(t, blockStored.KVCacheSpecSlidingWindowSize)
 	assert.Equal(t, 128, *blockStored.KVCacheSpecSlidingWindowSize)
 }
@@ -307,7 +306,7 @@ func TestDecodeVLLMEvent_BlockStoredExtraTrailingFields(t *testing.T) {
 	assert.Equal(t, [][]any{{"extra", "keys"}}, blockStored.ExtraKeys)
 	require.NotNil(t, blockStored.GroupIdx)
 	assert.Equal(t, 0, *blockStored.GroupIdx)
-	assert.Equal(t, kvblock.KVCacheSpecKindFullAttention, blockStored.KVCacheSpecKind)
+	assert.Equal(t, kvevents.KVCacheSpecKindFullAttention, blockStored.KVCacheSpecKind)
 }
 
 // TestDecodeVLLMEvent_BlockRemovedExtraTrailingFields tests forward compatibility for BlockRemoved.

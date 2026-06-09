@@ -33,8 +33,8 @@ func hmaCatalog(pods ...string) *kvblock.GroupCatalog {
 	c := kvblock.NewGroupCatalog()
 	window := 32
 	for _, pod := range pods {
-		c.Learn(pod, 0, kvblock.GroupMetadata{Kind: "full_attention", BlockSize: 16})
-		c.Learn(pod, 1, kvblock.GroupMetadata{Kind: "sliding_window", BlockSize: 16, SlidingWindowSize: &window})
+		c.Learn(pod, 0, kvblock.GroupMetadata{IsMainAttention: true, BlockSize: 16})
+		c.Learn(pod, 1, kvblock.GroupMetadata{BlockSize: 16, SlidingWindowSize: &window})
 	}
 	return c
 }
@@ -63,7 +63,7 @@ func TestHMAScoring(t *testing.T) {
 		name      string
 		keyToPods map[kvblock.BlockHash][]kvblock.PodEntry
 		catalog   *kvblock.GroupCatalog
-		want      map[string]float64
+		want      float64 // expected score for podA
 	}{
 		{
 			name:    "full hit — main group present at every block",
@@ -73,7 +73,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 			},
-			want: map[string]float64{podA: 3.0},
+			want: 3.0,
 		},
 		{
 			// The whole SWA group is gone for this prefix, so vLLM's convergence
@@ -86,7 +86,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0)},
 				3: {hmaEntry(podA, 0)},
 			},
-			want: map[string]float64{podA: 0.0},
+			want: 0.0,
 		},
 		{
 			// Full attention cached for all 3 blocks, but the SWA trailing block
@@ -99,7 +99,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 				3: {hmaEntry(podA, 0)}, // SWA trailing block gone
 			},
-			want: map[string]float64{podA: 2.0},
+			want: 2.0,
 		},
 		{
 			// The early SWA block (block 0) is outside the window and was
@@ -112,7 +112,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 			},
-			want: map[string]float64{podA: 3.0},
+			want: 3.0,
 		},
 		{
 			name:    "miss — only the SWA group present at the first block",
@@ -122,7 +122,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 			},
-			want: map[string]float64{podA: 0.0},
+			want: 0.0,
 		},
 		{
 			name:    "chain breaks where the main group goes missing",
@@ -132,7 +132,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 				3: {hmaEntry(podA, 1)}, // main group absent -> prefix stops at block 2
 			},
-			want: map[string]float64{podA: 2.0},
+			want: 2.0,
 		},
 		{
 			name:    "non-HMA entries — legacy behavior unchanged",
@@ -142,7 +142,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {{PodIdentifier: podA, DeviceTier: "gpu"}},
 				3: {{PodIdentifier: podA, DeviceTier: "gpu"}},
 			},
-			want: map[string]float64{podA: 3.0},
+			want: 3.0,
 		},
 		{
 			name:    "unlearned groups — group_idx 0 fallback treats group 0 as main",
@@ -152,7 +152,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 				3: {hmaEntry(podA, 0), hmaEntry(podA, 1)},
 			},
-			want: map[string]float64{podA: 3.0},
+			want: 3.0,
 		},
 		{
 			name:    "nil catalog — group_idx 0 fallback still routes on group 0",
@@ -162,7 +162,7 @@ func TestHMAScoring(t *testing.T) {
 				2: {hmaEntry(podA, 0)},
 				3: {hmaEntry(podA, 1)}, // non-zero group ignored under fallback
 			},
-			want: map[string]float64{podA: 2.0},
+			want: 2.0,
 		},
 	}
 
@@ -170,9 +170,7 @@ func TestHMAScoring(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scores, err := hmaScorer(tt.catalog).Score(context.Background(), keys, tt.keyToPods)
 			assert.NoError(t, err)
-			for pod, want := range tt.want {
-				assert.InDelta(t, want, scores[pod], 0.0001, "pod %s", pod)
-			}
+			assert.InDelta(t, tt.want, scores[podA], 0.0001)
 		})
 	}
 }
