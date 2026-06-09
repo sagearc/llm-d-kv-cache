@@ -14,7 +14,43 @@
 
 package kvevents
 
-import "github.com/llm-d/llm-d-kv-cache/pkg/kvcache/kvblock"
+// KVCacheSpecKind identifies vLLM KV cache group semantics. The string values
+// mirror vLLM's KVCacheSpec.kind wire values, parsed from the engine event.
+//
+// Only the kinds the scorer classifies on are enumerated. vLLM's other kinds
+// (mamba, chunked_local_attention, cross_attention, encoder_only_attention)
+// flow through as neither main attention nor sliding window, so no named
+// constants are needed for them.
+type KVCacheSpecKind string
+
+const (
+	KVCacheSpecKindFullAttention     KVCacheSpecKind = "full_attention"
+	KVCacheSpecKindMLAAttention      KVCacheSpecKind = "mla_attention"
+	KVCacheSpecKindSlidingWindow     KVCacheSpecKind = "sliding_window"
+	KVCacheSpecKindSlidingWindowMLA  KVCacheSpecKind = "sliding_window_mla"
+	KVCacheSpecKindSinkFullAttention KVCacheSpecKind = "sink_full_attention"
+)
+
+// IsMainAttention reports whether the kind is a "main attention" group
+// (full / MLA / sink-full). In vLLM's hybrid KV cache the realized prefix-cache
+// hit converges to the minimum across groups, and the main-attention group is
+// the binding constraint: it requires the whole prefix to be cached, whereas
+// sliding-window and other groups are looser. Scoring uses main-attention
+// groups to define the candidate prefix.
+func (k KVCacheSpecKind) IsMainAttention() bool {
+	switch k {
+	case KVCacheSpecKindFullAttention, KVCacheSpecKindMLAAttention, KVCacheSpecKindSinkFullAttention:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsSlidingWindow reports whether the kind is a sliding-window group, which
+// needs only a trailing window of contiguous cached blocks for a hit.
+func (k KVCacheSpecKind) IsSlidingWindow() bool {
+	return k == KVCacheSpecKindSlidingWindow || k == KVCacheSpecKindSlidingWindowMLA
+}
 
 // EventType represents the type of KV-cache event.
 type EventType string
@@ -78,7 +114,7 @@ type BlockStoredEvent struct {
 	// GroupIdx identifies the vLLM KV cache group that emitted this event.
 	GroupIdx *int
 	// KVCacheSpecKind carries vLLM's semantic cache type for the group.
-	KVCacheSpecKind kvblock.KVCacheSpecKind
+	KVCacheSpecKind KVCacheSpecKind
 	// KVCacheSpecSlidingWindowSize carries the SWA window size when applicable.
 	KVCacheSpecSlidingWindowSize *int
 }

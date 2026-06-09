@@ -21,55 +21,18 @@ import "sync"
 // GroupID identifies a vLLM KV cache group.
 type GroupID int
 
-// KVCacheSpecKind identifies vLLM KV cache group semantics. The string values
-// mirror vLLM's KVCacheSpec.kind wire values. This is the single source of
-// truth for the vocabulary; pkg/kvevents uses it directly (kvevents imports
-// this package, so the type must live here to avoid an import cycle).
-//
-// Only the kinds the scorer classifies on are enumerated. vLLM's other kinds
-// (mamba, chunked_local_attention, cross_attention, encoder_only_attention)
-// flow through unchanged and are treated as not-modeled — neither main
-// attention nor sliding window — so no named constants are needed for them.
-type KVCacheSpecKind string
-
-const (
-	KVCacheSpecKindFullAttention     KVCacheSpecKind = "full_attention"
-	KVCacheSpecKindMLAAttention      KVCacheSpecKind = "mla_attention"
-	KVCacheSpecKindSlidingWindow     KVCacheSpecKind = "sliding_window"
-	KVCacheSpecKindSlidingWindowMLA  KVCacheSpecKind = "sliding_window_mla"
-	KVCacheSpecKindSinkFullAttention KVCacheSpecKind = "sink_full_attention"
-)
-
-// IsMainAttention reports whether the kind is a "main attention" group
-// (full / MLA / sink-full attention).
-//
-// In vLLM's hybrid KV cache, the realized prefix-cache hit length converges to
-// the minimum across all groups, and the main-attention group is usually the
-// binding constraint: it requires the entire prefix to be cached, whereas
-// sliding window, Mamba, and other groups are looser (they need only a trailing
-// window or no prefix at all). Scoring therefore uses main-attention groups to
-// define the candidate prefix; sliding-window groups can only shrink it (see
-// GroupCatalog.SlidingWindowGroups), and other kinds are not modeled.
-func (k KVCacheSpecKind) IsMainAttention() bool {
-	switch k {
-	case KVCacheSpecKindFullAttention, KVCacheSpecKindMLAAttention, KVCacheSpecKindSinkFullAttention:
-		return true
-	default:
-		return false
-	}
-}
-
-// IsSlidingWindow reports whether the kind is a sliding-window group, which
-// needs only a trailing window of contiguous cached blocks for a hit (see
-// SlidingWindowGroups).
-func (k KVCacheSpecKind) IsSlidingWindow() bool {
-	return k == KVCacheSpecKindSlidingWindow || k == KVCacheSpecKindSlidingWindowMLA
-}
-
-// GroupMetadata holds per-group KV cache spec info learned from BlockStored events.
+// GroupMetadata holds the per-group properties the scorer needs, learned from
+// BlockStored events. It is engine-agnostic: the kvevents layer classifies the
+// engine's cache-spec kind into these fields, so this package stays free of
+// vLLM-specific vocabulary.
 type GroupMetadata struct {
-	Kind              KVCacheSpecKind
-	BlockSize         int
+	// IsMainAttention marks a group whose blocks gate the contiguous prefix
+	// (full / MLA / sink-full attention).
+	IsMainAttention bool
+	// BlockSize is the group's block size in tokens.
+	BlockSize int
+	// SlidingWindowSize, when non-nil, marks a sliding-window group and gives
+	// its window in tokens.
 	SlidingWindowSize *int
 }
 
@@ -98,19 +61,17 @@ func (c *GroupCatalog) Learn(podID string, g GroupID, meta GroupMetadata) {
 }
 
 // IsMainGroup reports whether group g on podID is a main-attention group whose
-// blocks gate prefix-cache routing (see KVCacheSpecKind.IsMainAttention).
+// blocks gate prefix-cache routing.
 //
-// When the catalog has not yet learned the group's kind — an event race before
-// the first BlockStored, or an older vLLM that does not emit kv_cache_spec_kind
-// — it falls back to treating group_idx 0 as the main group. The method is
+// When the catalog has not yet learned the group — an event race before the
+// first BlockStored, or an older vLLM that does not emit kv_cache_spec_kind —
+// it falls back to treating group_idx 0 as the main group. The method is
 // nil-safe: a nil catalog always uses the group_idx 0 fallback, so a scorer
 // wired without a catalog still routes correctly for the common case where full
 // attention is group 0.
 func (c *GroupCatalog) IsMainGroup(podID string, g GroupID) bool {
-	if c != nil {
-		if meta, ok := c.Get(podID, g); ok && meta.Kind != "" {
-			return meta.Kind.IsMainAttention()
-		}
+	if meta, ok := c.Get(podID, g); ok {
+		return meta.IsMainAttention
 	}
 	return g == 0
 }
@@ -130,10 +91,10 @@ type SlidingWindowGroup struct {
 // modeled at the given hashBlockSize (the request-key block size, mirroring
 // vLLM's hash_block_size).
 //
-// A group qualifies only when (1) its kind is sliding window, (2) its block
-// size equals hashBlockSize so its blocks align 1:1 with request keys — the
-// router indexes a single hash block size and cannot reconstruct a
-// differently-sized group's blocks — and (3) its window is known and large
+// A group qualifies only when (1) it is a sliding-window group (SlidingWindowSize
+// set), (2) its block size equals hashBlockSize so its blocks align 1:1 with
+// request keys — the router indexes a single hash block size and cannot
+// reconstruct a differently-sized group's blocks — and (3) its window is large
 // enough to require at least one trailing block. Groups that cannot be modeled
 // precisely are omitted, so the caller simply does not use them to shrink the
 // hit — never under-counting.
@@ -147,10 +108,7 @@ func (c *GroupCatalog) SlidingWindowGroups(podID string, hashBlockSize int) []Sl
 
 	var groups []SlidingWindowGroup
 	for g, meta := range c.entries[podID] {
-		if !meta.Kind.IsSlidingWindow() {
-			continue
-		}
-		if meta.BlockSize != hashBlockSize || meta.SlidingWindowSize == nil {
+		if meta.SlidingWindowSize == nil || meta.BlockSize != hashBlockSize {
 			continue
 		}
 		need := cdiv(*meta.SlidingWindowSize-1, hashBlockSize)
@@ -167,8 +125,12 @@ func cdiv(a, b int) int {
 	return (a + b - 1) / b
 }
 
-// Get returns the metadata for a pod group.
+// Get returns the metadata for a pod group. It is nil-safe.
 func (c *GroupCatalog) Get(podID string, g GroupID) (GroupMetadata, bool) {
+	if c == nil {
+		return GroupMetadata{}, false
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
