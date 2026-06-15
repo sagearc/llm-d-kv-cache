@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -90,7 +89,7 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 	}
 
 	// Wrap index with tracing instrumentation.
-	// When tracing is not configured, otel.Tracer() returns a no-op implementation.
+	// When tracing is not configured, the tracer is a no-op implementation.
 	kvBlockIndex = kvblock.NewTracedIndex(kvBlockIndex)
 
 	// override backend configs with the ones from the config, if the defaults are not used.
@@ -103,7 +102,7 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 	}
 
 	// Wrap scorer with tracing instrumentation.
-	// When tracing is not configured, otel.Tracer() returns a no-op implementation.
+	// When tracing is not configured, the tracer is a no-op implementation.
 	scorer := NewTracedScorer(prefixScorer)
 
 	indexer := &Indexer{
@@ -257,7 +256,7 @@ func (k *Indexer) ScoreTokens(
 	podIdentifiers []string,
 	extraFeatures []*kvblock.BlockExtraFeatures,
 ) (map[string]float64, error) {
-	tracer := otel.Tracer(telemetry.InstrumentationName)
+	tracer := telemetry.Tracer("llm-d-kv-cache/pkg/kvcache")
 	ctx, span := tracer.Start(ctx, "llm_d.kv_cache.score_tokens",
 		trace.WithSpanKind(trace.SpanKindInternal),
 	)

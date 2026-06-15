@@ -28,10 +28,16 @@
 #include <string>
 
 // Constructor - initializes configuration
-TensorCopier::TensorCopier(std::vector<torch::Tensor>& tensors,
-                           int gpu_blocks_per_file)
-    : m_gpu_blocks_per_file(gpu_blocks_per_file), m_gpu_tensors(tensors) {
+TensorCopier::TensorCopier(
+    std::vector<torch::Tensor>& tensors,
+    std::vector<std::vector<int64_t>> group_tensor_indices,
+    int gpu_blocks_per_file)
+    : m_gpu_blocks_per_file(gpu_blocks_per_file),
+      m_gpu_tensors(tensors),
+      m_group_tensor_indices(std::move(group_tensor_indices)) {
   TORCH_CHECK(!m_gpu_tensors.empty(), "TensorCopier: tensors is empty");
+  TORCH_CHECK(!m_group_tensor_indices.empty(),
+              "TensorCopier: group_tensor_indices is empty");
   TORCH_CHECK(m_gpu_blocks_per_file > 0,
               "TensorCopier: gpu_blocks_per_file must be > 0");
   TORCH_CHECK(tensors[0].is_contiguous(), "GPU tensor must be contiguous");
@@ -58,13 +64,16 @@ TensorCopier::TensorCopier(std::vector<torch::Tensor>& tensors,
               << ", use_kernel_copy_write=" << m_use_kernel_copy_write
               << ", use_batch_memcpy_read=" << m_use_batch_memcpy_read
               << ", use_batch_memcpy_write=" << m_use_batch_memcpy_write
-              << ", m_gpu_blocks_per_file=" << m_gpu_blocks_per_file);
+              << ", m_gpu_blocks_per_file=" << m_gpu_blocks_per_file
+              << ", num_groups=" << m_group_tensor_indices.size());
 }
 
 // Performs block transfers using cudaMemcpyAsync (DMA-based copy)
 void TensorCopier::copy_blocks_via_cuda_memcpy(
     uint8_t* cpu_base,
     const std::vector<int64_t>& block_ids_list,
+    int group_idx,
+    int head_offset,
     bool is_store) {
   uint8_t** src;
   uint8_t** dst;
@@ -83,18 +92,22 @@ void TensorCopier::copy_blocks_via_cuda_memcpy(
     dst = &gpu_blk_ptr;
   }
 
+  const auto& tensor_indices = m_group_tensor_indices[group_idx];
+  const size_t num_tensors = tensor_indices.size();
+
   // Get current CUDA stream
   const auto stream = at::cuda::getCurrentCUDAStream();
-  //  Compute CPU block offset, Each block in CPU memory stores all layers
-  //  sequentially: [layer0_data, layer1_data, ..., layerN_data]
-  cpu_blk_ptr = cpu_base + (m_gpu_blocks_per_file - block_ids_list.size()) *
-                               m_gpu_tensors.size() * m_tensor_block_size;
+  // CPU buffer slot where this group's data lives. Each slot stores all
+  // layers sequentially: [layer0_data, layer1_data, ..., layerN_data].
+  // head_offset is the file-relative starting slot for this transfer.
+  cpu_blk_ptr = cpu_base + static_cast<size_t>(head_offset) * num_tensors *
+                               m_tensor_block_size;
 
   for (size_t bi = 0; bi < block_ids_list.size(); ++bi) {
     int64_t gpu_block_idx = block_ids_list[bi];
-    // Process all layers for this block (for cross-layer layout is just one
-    // layer)
-    for (const auto& tensor : m_gpu_tensors) {
+    // Process only tensors belonging to this group
+    for (int64_t tidx : tensor_indices) {
+      const auto& tensor = m_gpu_tensors[tidx];
       gpu_blk_ptr = reinterpret_cast<uint8_t*>(tensor.data_ptr()) +
                     gpu_block_idx * m_tensor_block_size;
       // Perform async copy - returns immediately, transfers in background
@@ -112,13 +125,16 @@ void TensorCopier::copy_blocks_via_cuda_memcpy(
 }
 
 // Batched DMA path: one cudaMemcpyBatchAsync covers all per-(block, layer)
-// copies for the blocks in this file (num_blocks * num_tensors).
+// copies for the blocks in this file (num_blocks * num_tensors_in_group).
 // The batch executes in stream order; ordering within the batch is unspecified.
 void TensorCopier::copy_blocks_via_batch_memcpy(
     uint8_t* cpu_base,
     const std::vector<int64_t>& block_ids_list,
+    int group_idx,
+    int head_offset,
     bool is_store) {
-  const size_t num_tensors = m_gpu_tensors.size();
+  const auto& tensor_indices = m_group_tensor_indices[group_idx];
+  const size_t num_tensors = tensor_indices.size();
   const size_t num_blocks = block_ids_list.size();
   const size_t total = num_tensors * num_blocks;
   if (total == 0) return;
@@ -132,18 +148,20 @@ void TensorCopier::copy_blocks_via_batch_memcpy(
   srcs.resize(total);
   sizes.resize(total);
 
-  //  Compute CPU block offset, Each block in CPU memory stores all layers
-  //  sequentially: [layer0_data, layer1_data, ..., layerN_data]
-  uint8_t* cpu_blk_ptr = cpu_base + (m_gpu_blocks_per_file - num_blocks) *
+  // CPU buffer slot where this group's data lives (head_offset is the
+  // file-relative starting slot). Each slot holds all layers sequentially:
+  // [layer0_data, layer1_data, ..., layerN_data].
+  uint8_t* cpu_blk_ptr = cpu_base + static_cast<size_t>(head_offset) *
                                         num_tensors * m_tensor_block_size;
 
   // Build one (dst, src, size) descriptor per (block, layer) copy.
   size_t idx = 0;
   for (size_t bi = 0; bi < num_blocks; ++bi) {
     int64_t gpu_block_idx = block_ids_list[bi];
-    for (const auto& tensor : m_gpu_tensors) {
-      uint8_t* gpu_blk_ptr = reinterpret_cast<uint8_t*>(tensor.data_ptr()) +
-                             gpu_block_idx * m_tensor_block_size;
+    for (int64_t tidx : tensor_indices) {
+      uint8_t* gpu_blk_ptr =
+          reinterpret_cast<uint8_t*>(m_gpu_tensors[tidx].data_ptr()) +
+          gpu_block_idx * m_tensor_block_size;
       if (is_store) {
         srcs[idx] = gpu_blk_ptr;
         dsts[idx] = cpu_blk_ptr;
@@ -157,23 +175,20 @@ void TensorCopier::copy_blocks_via_batch_memcpy(
     }
   }
 
-#if CUDA_VERSION >= 12080
   // Set attributes with srcAccessOrder=ANY (cudaMemcpySrcAccessOrderAny)
   // for malloc'd host staging buffer. Same as vLLM's cuda_mem_ops.py.
-  // static (not thread_local): never mutated, no per-thread duplication needed.
-  // Not const: CUDA's C API takes non-const pointers.
-  static cudaMemcpyAttributes attrs = [] {
+  thread_local cudaMemcpyAttributes attrs = [] {
     cudaMemcpyAttributes a{};
     a.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
     return a;
   }();
-  static size_t attrs_idx = 0;
+  thread_local size_t attrs_idx = 0;
 
   // Get current CUDA stream
   const auto stream = at::cuda::getCurrentCUDAStream();
 
   // CUDA 13 dropped the failIdx out-param; CUDA 12.8/12.9 still requires it.
-  #if CUDA_VERSION >= 13000
+#if CUDA_VERSION >= 13000
   cudaError_t err = cudaMemcpyBatchAsync(dsts.data(),
                                          srcs.data(),
                                          sizes.data(),
@@ -182,7 +197,7 @@ void TensorCopier::copy_blocks_via_batch_memcpy(
                                          &attrs_idx,
                                          /*numAttrs=*/1,
                                          stream.stream());
-  #else
+#else
   static thread_local size_t fail_idx;
   cudaError_t err = cudaMemcpyBatchAsync(dsts.data(),
                                          srcs.data(),
@@ -193,14 +208,10 @@ void TensorCopier::copy_blocks_via_batch_memcpy(
                                          /*numAttrs=*/1,
                                          &fail_idx,
                                          stream.stream());
-  #endif
+#endif
   TORCH_CHECK(err == cudaSuccess,
               "cudaMemcpyBatchAsync failed err=",
               cudaGetErrorString(err));
-#else
-  // CUDA < 12.8: cudaMemcpyBatchAsync is not available — fall back.
-  copy_blocks_via_cuda_memcpy(cpu_base, block_ids_list, is_store);
-#endif
 }
 
 // Dispatches to one of three paths (priority: batch > kernel > memcpy):
@@ -210,15 +221,29 @@ void TensorCopier::copy_blocks_via_batch_memcpy(
 //   - memcpy loop:  one cudaMemcpyAsync per (block, layer) (fallback).
 void TensorCopier::copy_blocks(uint8_t* cpu_base,
                                const std::vector<int64_t>& block_ids_list,
+                               int group_idx,
+                               int head_offset,
                                bool is_store) {
   bool use_batch =
       is_store ? m_use_batch_memcpy_write : m_use_batch_memcpy_read;
   bool use_kernel = is_store ? m_use_kernel_copy_write : m_use_kernel_copy_read;
   if (use_batch) {
-    copy_blocks_via_batch_memcpy(cpu_base, block_ids_list, is_store);
+    copy_blocks_via_batch_memcpy(cpu_base,
+                                 block_ids_list,
+                                 group_idx,
+                                 head_offset,
+                                 is_store);
   } else if (use_kernel) {
-    copy_blocks_via_kernels(cpu_base, block_ids_list, is_store);
+    copy_blocks_via_kernels(cpu_base,
+                            block_ids_list,
+                            group_idx,
+                            head_offset,
+                            is_store);
   } else {
-    copy_blocks_via_cuda_memcpy(cpu_base, block_ids_list, is_store);
+    copy_blocks_via_cuda_memcpy(cpu_base,
+                                block_ids_list,
+                                group_idx,
+                                head_offset,
+                                is_store);
   }
 }

@@ -11,9 +11,19 @@ NAMESPACE ?= hc4ai-operator
 TARGETOS ?= $(shell go env GOOS)
 TARGETARCH ?= $(shell go env GOARCH)
 
+# Build metadata injected into the version package via -ldflags.
+VERSION_PKG := github.com/llm-d/llm-d-kv-cache/version
+GIT_COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+BUILD_REF ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo $(DEV_VERSION))
+LDFLAGS := -X '$(VERSION_PKG).CommitSHA=$(GIT_COMMIT)' -X '$(VERSION_PKG).BuildRef=$(BUILD_REF)'
+
 PYTHON_EXE := $(shell command -v python3.12 || command -v python3)
 
-CONTAINER_TOOL := $(shell { command -v docker >/dev/null 2>&1 && echo docker; } || { command -v podman >/dev/null 2>&1 && echo podman; } || echo "")
+CONTAINER_TOOL := $(shell { command -v docker >/dev/null 2>&1 && echo docker; } || { command -v podman >/dev/null 2>&1 && echo podman; })
+
+ifeq ($(CONTAINER_TOOL),)
+$(error Neither docker nor podman is installed. Try: sudo apt install docker.io OR brew install docker)
+endif
 BUILDER := $(shell command -v buildah >/dev/null 2>&1 && echo buildah || echo $(CONTAINER_TOOL))
 UDS_TOKENIZER_IMAGE ?= llm-d-uds-tokenizer:e2e-test
 FS_BACKEND_NAME ?= llmd-fs-backend
@@ -107,9 +117,7 @@ e2e-test: e2e-test-uds ## Run end-to-end tests
 image-build-uds: check-container-tool ## Build the UDS tokenizer container image
 	@printf "\033[33;1m==== Building UDS tokenizer image $(UDS_TOKENIZER_IMAGE) ====\033[0m\n"
 	$(CONTAINER_TOOL) build \
-		--platform $(TARGETOS)/$(TARGETARCH) \
-		--build-arg TARGETOS=$(TARGETOS) \
-		--build-arg TARGETARCH=$(TARGETARCH) \
+		--platform linux/$(TARGETARCH) \
 		-t $(UDS_TOKENIZER_IMAGE) services/uds_tokenizer
 
 .PHONY: e2e-test-uds
@@ -172,16 +180,14 @@ build-uds: check-go download-zmq ## Build
 	@printf "\033[33;1m==== Building ====\033[0m\n"
 	@go build ./pkg/...
 	@mkdir -p bin
-	@go build -o bin/$(PROJECT_NAME) ./examples/kv_events/online
+	@go build -ldflags "$(LDFLAGS)" -o bin/$(PROJECT_NAME) ./examples/kv_events/online
 	@echo "✅ Build succeeded"
 
 .PHONY:	image-build
 image-build: check-container-tool load-version-json ## Build Docker image
 	@printf "\033[33;1m==== Building Docker image $(IMG) ====\033[0m\n"
 	$(CONTAINER_TOOL) build \
-		--platform $(TARGETOS)/$(TARGETARCH) \
-		--build-arg TARGETOS=$(TARGETOS) \
-		--build-arg TARGETARCH=$(TARGETARCH) \
+		--platform linux/$(TARGETARCH) \
 		-t $(IMG) .
 .PHONY: image-push
 image-push: check-container-tool load-version-json ## Push Docker image $(IMG) to registry
@@ -500,7 +506,7 @@ define BUILD_EXAMPLE_TEMPLATE
 $(1): $$(SRC) | check-go
 	@echo "Building $$@..."
 	@mkdir -p $$(dir $$@)
-	@go build -o $$@ $(2)
+	@go build -ldflags "$(LDFLAGS)" -o $$@ $(2)
 	@echo "✅ Built $$@"
 endef
 
@@ -573,9 +579,7 @@ run-example: ## Run the example with UDS tokenizer in Docker (e.g., make run-exa
 image-fs-backend-build: check-container-tool load-version-json ## Build the development container for the llmd_fs_backend connector
 	@printf "\033[33;1m==== Building development container $(FS_BACKEND_DEV_IMG) ====\033[0m\n"
 	$(CONTAINER_TOOL) build \
-		--platform $(TARGETOS)/$(TARGETARCH) \
-		--build-arg TARGETOS=$(TARGETOS) \
-		--build-arg TARGETARCH=$(TARGETARCH) \
+		--platform linux/$(TARGETARCH) \
 		-f kv_connectors/llmd_fs_backend/Dockerfile.dev \
 		-t $(FS_BACKEND_DEV_IMG) .
 
