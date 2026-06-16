@@ -178,24 +178,7 @@ func (c BlockHash) String() string {
 	return strconv.FormatUint(uint64(c), 10)
 }
 
-// AttentionKind classifies a KV cache group's attention type for scoring,
-// engine-agnostically (the kvevents layer maps the engine's cache-spec kind
-// onto it). The zero value covers non-HMA entries and any kind that is neither
-// main-attention nor sliding-window (e.g. mamba), which scoring ignores.
-type AttentionKind uint8
-
-const (
-	AttentionUnknown       AttentionKind = iota // non-HMA, or a not-scored kind
-	AttentionMain                               // full / MLA / sink-full
-	AttentionSlidingWindow                      // sliding-window
-)
-
-// PodEntry struct represents a pod entry in the KV-block index. The whole
-// struct is the dedup/eviction key. The leading fields come from the engine
-// event; the trailing fields are own-group HMA attention metadata the pool
-// stamps (and reproduces from its catalog when servicing a BlockRemoved, which
-// carries only group_idx), read by the scorer. Because they are deterministic
-// per group, the rebuilt key matches the stored one.
+// PodEntry struct represents a pod entry in the KV-block index.
 type PodEntry struct {
 	// PodIdentifier is the unique identifier for the pod.
 	PodIdentifier string
@@ -207,15 +190,6 @@ type PodEntry struct {
 	HasGroup bool
 	// GroupIdx identifies the vLLM KV cache group for HMA events.
 	GroupIdx GroupID
-
-	// AttentionKind classifies this entry's own group (main / sliding-window /
-	// other). Meaningful only when HasGroup; non-HMA entries are AttentionUnknown
-	// and always count toward the prefix, preserving legacy uniform behavior.
-	AttentionKind AttentionKind `json:"attentionKind,omitempty"`
-	// SlidingWindowSize is this entry's own sliding-window size in tokens, set
-	// only for AttentionSlidingWindow groups. Scoring converts it to a
-	// trailing-block count at the router's canonical block size.
-	SlidingWindowSize int `json:"slidingWindowSize,omitempty"`
 }
 
 // String returns a string representation of the PodEntry.

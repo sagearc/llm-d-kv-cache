@@ -67,6 +67,7 @@ type Indexer struct {
 	tokenProcessor kvblock.TokenProcessor // turns tokens to kv block keys
 	kvBlockIndex   kvblock.Index          // looks up pods for block keys
 	kvBlockScorer  KVBlockScorer          // scores pods based on block hits
+	prefixScorer   *LongestPrefixScorer   // concrete scorer, for SetGroupCatalog wiring
 
 	tokenizersPool TokenizersPool
 }
@@ -93,6 +94,8 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 
 	// override backend configs with the ones from the config, if the defaults are not used.
 	config.KVBlockScorerConfig.BackendConfigs = config.BackendConfigs
+	// Keep the concrete scorer for SetGroupCatalog wiring; tracing wraps it
+	// behind the KVBlockScorer interface for the scoring path.
 	prefixScorer, err := NewKVBlockScorer(config.KVBlockScorerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create KVBlockScorer: %w", err)
@@ -110,6 +113,7 @@ func NewKVCacheIndexer(ctx context.Context, config *Config, tokenProcessor kvblo
 		tokenProcessor: tokenProcessor,
 		kvBlockIndex:   kvBlockIndex,
 		kvBlockScorer:  scorer,
+		prefixScorer:   prefixScorer,
 	}
 
 	if config.TokenizersPoolConfig != nil {
@@ -135,6 +139,18 @@ func (k *Indexer) Run(ctx context.Context) {
 // KVBlockIndex returns the kvblock.Index used by the Indexer.
 func (k *Indexer) KVBlockIndex() kvblock.Index {
 	return k.kvBlockIndex
+}
+
+// SetGroupCatalog points the scorer at the kvevents.Pool's HMA group catalog so
+// group metadata learned from events reaches scoring. Pass pool.GroupCatalog()
+// after constructing the pool. The field write is unsynchronized: call this
+// during wiring, before the indexer starts serving Score requests. A no-op when
+// the indexer has no concrete prefix scorer (e.g. one built via
+// NewIndexerForTest).
+func (k *Indexer) SetGroupCatalog(catalog *kvblock.GroupCatalog) {
+	if k.prefixScorer != nil {
+		k.prefixScorer.Catalog = catalog
+	}
 }
 
 // ErrInternalTokenizationDisabled is returned by the deprecated prompt-string

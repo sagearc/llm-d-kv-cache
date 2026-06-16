@@ -58,9 +58,8 @@ type KVBlockScorer interface {
 
 // NewKVBlockScorer creates a new KVBlockScorer based on the provided strategy.
 //
-// HMA group-aware scoring needs no extra wiring: the pool stamps each PodEntry
-// with its own group's attention kind and window, and the scorer reads them off
-// the entry. Set CanonicalBlockSize to enable the sliding-window reduction.
+// To enable HMA group-aware scoring, wire the kvevents.Pool's catalog via
+// SetGroupCatalog.
 func NewKVBlockScorer(config *KVBlockScorerConfig) (*LongestPrefixScorer, error) {
 	switch config.ScoringStrategy {
 	case LongestPrefixMatch:
@@ -83,52 +82,14 @@ func NewKVBlockScorer(config *KVBlockScorerConfig) (*LongestPrefixScorer, error)
 type LongestPrefixScorer struct {
 	// MediumWeights maps medium/device tier names to their scoring weights.
 	MediumWeights map[string]float64
+	// Catalog enables HMA group-aware scoring; may be nil (uniform attention).
+	// Wired post-construction from the kvevents.Pool via Indexer.SetGroupCatalog.
+	Catalog *kvblock.GroupCatalog
 	// CanonicalBlockSize is the token-processor block size at which request keys
 	// are chunked. Sliding-window token counts convert to request-key counts with
 	// it, so scoring never depends on any engine block size. Zero disables the
 	// window-aware reduction (phase 2 and the SWA-only fallback become no-ops).
 	CanonicalBlockSize int
-}
-
-// podAttention summarizes a pod's attention topology as observed from the
-// entries present at the scored keys. Because only the entry's own group kind
-// is recorded (no model-level summary), this is a best-effort view: a hybrid
-// pod whose main-attention blocks are all absent from this query looks
-// main-less here. That trades the SWA-evicted-while-FA-survives precision for a
-// catalog-free scorer.
-type podAttention struct {
-	// hasMain is true if the pod has a main-attention (or non-HMA) entry present
-	// at any scored key.
-	hasMain bool
-	// slidingWindowSize is the largest own-group sliding-window size (tokens)
-	// among the pod's present entries (0 = no sliding-window entry present).
-	slidingWindowSize int
-}
-
-// collectPodAttention builds the per-pod attention view from the entries at the
-// scored keys.
-func collectPodAttention(keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) map[string]podAttention {
-	meta := make(map[string]podAttention)
-	for _, entries := range keyToPods {
-		for _, e := range entries {
-			m := meta[e.PodIdentifier]
-			// Non-HMA entries (no group) and main-attention groups both anchor
-			// the main-prefix path.
-			if !e.HasGroup || e.AttentionKind == kvblock.AttentionMain {
-				m.hasMain = true
-			}
-			if e.AttentionKind == kvblock.AttentionSlidingWindow && e.SlidingWindowSize > m.slidingWindowSize {
-				m.slidingWindowSize = e.SlidingWindowSize
-			}
-			meta[e.PodIdentifier] = m
-		}
-	}
-	return meta
-}
-
-// cdiv returns ceil(a/b) for non-negative a and positive b (mirrors vLLM's cdiv).
-func cdiv(a, b int) int {
-	return (a + b - 1) / b
 }
 
 // Strategy returns the strategy type: LongestPrefixMatch.
@@ -146,10 +107,11 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 // scoring overall: Score's phase 2 uses their presence to bound the hit length.
 // Mamba, chunked-local, and other kinds are not modeled. Non-HMA entries (no
 // group identity) always count, preserving legacy uniform-attention behavior.
-// Classification reads the entry's own AttentionKind, stamped by the pool.
+// Classification is via kvblock.GroupCatalog.IsMainGroup (nil-safe, with a
+// group_idx 0 fallback).
 func (s *LongestPrefixScorer) fillMainWeights(dst map[string]float64, entries []kvblock.PodEntry) {
 	for _, entry := range entries {
-		if entry.HasGroup && entry.AttentionKind != kvblock.AttentionMain {
+		if entry.HasGroup && !s.Catalog.IsMainGroup(entry.PodIdentifier, entry.GroupIdx) {
 			continue
 		}
 		weight := 1.0
@@ -195,9 +157,6 @@ func (s *LongestPrefixScorer) Score(
 		return make(map[string]float64), nil
 	}
 
-	// Per-pod attention view, read from the kind/window stamped on each entry.
-	podMeta := collectPodAttention(keyToPods)
-
 	// Phase 1: per-pod main-attention prefix, recording cumulative per-block
 	// weights so phase 2 can truncate to the converged hit without re-summing.
 	cumWeights := make(map[string][]float64)
@@ -235,8 +194,8 @@ func (s *LongestPrefixScorer) Score(
 	podScores := make(map[string]float64, len(cumWeights))
 	for pod, cum := range cumWeights {
 		hit := len(cum)
-		if cb := s.contiguousBlocks(podMeta[pod].slidingWindowSize); cb > 0 {
-			hit = slidingWindowHitLen(pod, cb, hit, keys, keyToPods)
+		if classes := s.Catalog.SlidingWindowClasses(pod, s.CanonicalBlockSize); len(classes) > 0 {
+			hit = windowReducedHit(pod, classes, hit, keys, keyToPods)
 		}
 		if hit == 0 {
 			podScores[pod] = 0
@@ -245,55 +204,63 @@ func (s *LongestPrefixScorer) Score(
 		podScores[pod] = cum[hit-1]
 	}
 
-	s.scorePodsWithoutMainGroup(podScores, podMeta, keys, keyToPods)
+	s.scorePodsWithoutMainGroup(podScores, keys, keyToPods)
 
 	return podScores, nil
 }
 
-// contiguousBlocks converts a sliding-window size in tokens to the number of
-// contiguous trailing canonical-block keys a hit requires: cdiv(window-1,
-// canonicalBlockSize), mirroring vLLM's SlidingWindowManager in router units.
-// Returns 0 when windowing is disabled (no window, or no canonical block size).
-func (s *LongestPrefixScorer) contiguousBlocks(slidingWindowSize int) int {
-	if slidingWindowSize <= 0 || s.CanonicalBlockSize <= 0 {
-		return 0
+// windowReducedHit shrinks hit to the longest prefix whose trailing window is
+// present for every sliding-window class, mirroring vLLM's hybrid convergence:
+// each class either accepts the candidate length or reduces it, and any
+// reduction restarts the checks (sliding-window hits are not downward-closed,
+// so a single sequential pass could overstate). The loop converges because hit
+// is monotonically decreasing and bounded by 0. With one class — one window
+// per model, the common case — a single scan is exact and no iteration runs.
+func windowReducedHit(
+	pod string,
+	classes []kvblock.SlidingWindowClass,
+	hit int,
+	keys []kvblock.BlockHash,
+	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
+) int {
+	for hit > 0 {
+		prev := hit
+		for _, class := range classes {
+			if l := slidingWindowHitLen(pod, class, hit, keys, keyToPods); l < hit {
+				hit = l
+			}
+		}
+		if hit == prev || len(classes) == 1 {
+			break
+		}
 	}
-	need := cdiv(slidingWindowSize-1, s.CanonicalBlockSize)
-	if need <= 0 {
-		return 0
-	}
-	return need
+	return hit
 }
 
-// scorePodsWithoutMainGroup scores pods that look SWA-only at these keys (a
-// sliding-window entry present, no main-attention entry present). vLLM serves
-// SWA-only models through its unitary coordinator: the trailing-window scan
-// runs over the whole request, not bounded by a full-attention prefix. Blocks
-// inside the hit score at the pod's tier weight where it holds entries, and 1.0
-// where it holds none: those are the null-prefix blocks vLLM fills in — outside
-// every window, skipped by the engine entirely, so the saved compute is
-// tier-independent.
+// scorePodsWithoutMainGroup scores pods running SWA-only models (no
+// main-attention group learned). vLLM serves these through its unitary
+// coordinator: the trailing-window scan runs over the whole request, not
+// bounded by a full-attention prefix. Blocks inside the hit score at the pod's
+// tier weight where it holds entries, and 1.0 where it holds none: those are
+// the null-prefix blocks vLLM fills in — outside every window, skipped by the
+// engine entirely, so the saved compute is tier-independent.
 //
-// Detection is best-effort from entry presence: a hybrid pod whose
-// main-attention blocks are absent from this query is indistinguishable from an
-// SWA-only pod here, and may be scored by this path. Distinguishing them would
-// require model-level topology, which the catalog-free scorer does not carry.
+// Pods are drawn from catalog topology, not from entry presence at these keys:
+// a hybrid-model pod with a cold main-attention cache must keep scoring 0 here
+// (vLLM's full-attention phase bounds its hit to 0), which entry-based
+// detection would get wrong.
 func (s *LongestPrefixScorer) scorePodsWithoutMainGroup(
 	podScores map[string]float64,
-	podMeta map[string]podAttention,
 	keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 ) {
-	for pod, meta := range podMeta {
-		if meta.hasMain {
+	for _, pod := range s.Catalog.PodsWithoutMainGroup() {
+		classes := s.Catalog.SlidingWindowClasses(pod, s.CanonicalBlockSize)
+		if len(classes) == 0 {
+			// No modeled sliding-window group (e.g. mamba-only): not scored.
 			continue
 		}
-		cb := s.contiguousBlocks(meta.slidingWindowSize)
-		if cb == 0 {
-			// No sliding-window entry present (e.g. mamba-only): not scored.
-			continue
-		}
-		hit := slidingWindowHitLen(pod, cb, len(keys), keys, keyToPods)
+		hit := windowReducedHit(pod, classes, len(keys), keys, keyToPods)
 		if hit == 0 {
 			continue
 		}
@@ -333,28 +300,25 @@ func (s *LongestPrefixScorer) maxPodWeight(entries []kvblock.PodEntry, pod strin
 }
 
 // slidingWindowHitLen returns the longest prefix length (in blocks, capped at
-// maxBlocks) for which pod has the contiguous trailing window of
-// contiguousBlocks sliding-window blocks. It mirrors vLLM's
-// SlidingWindowManager.find_longest_cache_hit: scan right-to-left and stop once
-// contiguousBlocks blocks are contiguously present; if the window never
-// completes, the contiguous run anchored at block 0 still counts (a prefix
-// shorter than the window).
-//
-// Presence at a block is a single sliding-window entry for the pod. One
-// sliding-window spec per model is assumed; models with several distinct
-// sliding-window specs (which vLLM looks up jointly) are not modeled here.
+// maxBlocks) for which pod has the contiguous trailing window required by the
+// sliding-window class. It mirrors vLLM's SlidingWindowManager.find_longest_cache_hit:
+// scan right-to-left and stop once ContiguousBlocks blocks are contiguously
+// present; if the window never completes, the contiguous run anchored at block 0
+// still counts (a prefix shorter than the window). Presence at a block requires
+// an entry for every group in the class, matching vLLM's joint lookup across
+// same-spec groups (a miss in any group is a miss).
 func slidingWindowHitLen(
 	pod string,
-	contiguousBlocks int,
+	class kvblock.SlidingWindowClass,
 	maxBlocks int,
 	keys []kvblock.BlockHash,
 	keyToPods map[kvblock.BlockHash][]kvblock.PodEntry,
 ) int {
 	contiguous := 0
 	for i := maxBlocks - 1; i >= 0; i-- {
-		if slidingWindowPresent(keyToPods[keys[i]], pod) {
+		if allGroupsPresent(keyToPods[keys[i]], pod, class.GroupIDs) {
 			contiguous++
-			if contiguous >= contiguousBlocks {
+			if contiguous >= class.ContiguousBlocks {
 				return i + contiguous
 			}
 		} else {
@@ -364,10 +328,21 @@ func slidingWindowHitLen(
 	return contiguous
 }
 
-// slidingWindowPresent reports whether pod holds a sliding-window entry at this block.
-func slidingWindowPresent(entries []kvblock.PodEntry, pod string) bool {
+// allGroupsPresent reports whether pod holds an entry for every KV cache group
+// in groups at this block.
+func allGroupsPresent(entries []kvblock.PodEntry, pod string, groups []kvblock.GroupID) bool {
+	for _, g := range groups {
+		if !groupPresent(entries, pod, g) {
+			return false
+		}
+	}
+	return true
+}
+
+// groupPresent reports whether pod holds an entry for KV cache group g at this block.
+func groupPresent(entries []kvblock.PodEntry, pod string, g kvblock.GroupID) bool {
 	for _, e := range entries {
-		if e.PodIdentifier == pod && e.HasGroup && e.AttentionKind == kvblock.AttentionSlidingWindow {
+		if e.PodIdentifier == pod && e.HasGroup && e.GroupIdx == g {
 			return true
 		}
 	}
