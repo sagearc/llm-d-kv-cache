@@ -114,10 +114,10 @@ func collectPodAttention(keyToPods map[kvblock.BlockHash][]kvblock.PodEntry) map
 			m := meta[e.PodIdentifier]
 			// Non-HMA entries (no group) and main-attention groups both anchor
 			// the main-prefix path.
-			if !e.HasGroup || e.AttentionKind.IsMainAttention() {
+			if !e.HasGroup || e.AttentionKind == kvblock.AttentionMain {
 				m.hasMain = true
 			}
-			if e.AttentionKind.IsSlidingWindow() && e.SlidingWindowSize > m.slidingWindowSize {
+			if e.AttentionKind == kvblock.AttentionSlidingWindow && e.SlidingWindowSize > m.slidingWindowSize {
 				m.slidingWindowSize = e.SlidingWindowSize
 			}
 			meta[e.PodIdentifier] = m
@@ -149,7 +149,7 @@ func (s *LongestPrefixScorer) Strategy() KVScoringStrategy {
 // Classification reads the entry's own AttentionKind, stamped by the pool.
 func (s *LongestPrefixScorer) fillMainWeights(dst map[string]float64, entries []kvblock.PodEntry) {
 	for _, entry := range entries {
-		if entry.HasGroup && !entry.AttentionKind.IsMainAttention() {
+		if entry.HasGroup && entry.AttentionKind != kvblock.AttentionMain {
 			continue
 		}
 		weight := 1.0
@@ -367,7 +367,7 @@ func slidingWindowHitLen(
 // slidingWindowPresent reports whether pod holds a sliding-window entry at this block.
 func slidingWindowPresent(entries []kvblock.PodEntry, pod string) bool {
 	for _, e := range entries {
-		if e.PodIdentifier == pod && e.HasGroup && e.AttentionKind.IsSlidingWindow() {
+		if e.PodIdentifier == pod && e.HasGroup && e.AttentionKind == kvblock.AttentionSlidingWindow {
 			return true
 		}
 	}

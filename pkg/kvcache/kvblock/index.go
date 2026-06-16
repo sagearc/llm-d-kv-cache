@@ -190,12 +190,6 @@ const (
 	AttentionSlidingWindow                      // sliding-window
 )
 
-// IsMainAttention reports whether the kind gates the contiguous prefix.
-func (k AttentionKind) IsMainAttention() bool { return k == AttentionMain }
-
-// IsSlidingWindow reports whether the kind is a sliding-window group.
-func (k AttentionKind) IsSlidingWindow() bool { return k == AttentionSlidingWindow }
-
 // PodEntry struct represents a pod entry in the KV-block index. The whole
 // struct is the dedup/eviction key. The leading fields come from the engine
 // event; the trailing fields are own-group HMA attention metadata the pool
