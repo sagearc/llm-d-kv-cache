@@ -196,16 +196,12 @@ func (k AttentionKind) IsMainAttention() bool { return k == AttentionMain }
 // IsSlidingWindow reports whether the kind is a sliding-window group.
 func (k AttentionKind) IsSlidingWindow() bool { return k == AttentionSlidingWindow }
 
-// PodEntry struct represents a pod entry in the KV-block index.
-//
-// The first five fields are the entry's identity, sourced directly from the
-// engine event. The trailing fields are own-group HMA attention metadata the
-// pool stamps from the BlockStored event, and which the scorer reads off the
-// entry instead of consulting a catalog. They are deterministic per group, so
-// the pool reproduces them identically when it rebuilds an entry from its
-// catalog to service a BlockRemoved (which carries only group_idx) — keeping
-// the whole struct usable as the dedup/eviction key without a separate identity
-// projection.
+// PodEntry struct represents a pod entry in the KV-block index. The whole
+// struct is the dedup/eviction key. The leading fields come from the engine
+// event; the trailing fields are own-group HMA attention metadata the pool
+// stamps (and reproduces from its catalog when servicing a BlockRemoved, which
+// carries only group_idx), read by the scorer. Because they are deterministic
+// per group, the rebuilt key matches the stored one.
 type PodEntry struct {
 	// PodIdentifier is the unique identifier for the pod.
 	PodIdentifier string

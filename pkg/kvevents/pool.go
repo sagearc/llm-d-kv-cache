@@ -331,7 +331,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			entry := kvblock.PodEntry{PodIdentifier: podIdentifier, DeviceTier: deviceTier}
 			if ev.GroupIdx != nil {
 				groupID := kvblock.GroupID(*ev.GroupIdx)
 				// Classify the vLLM cache-spec kind into the engine-agnostic
@@ -343,10 +343,10 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				// Stamp the entry and remember the group so a BlockRemoved (which
 				// lacks the kind/window) can be rebuilt into the same entry.
 				p.groupCatalog.Learn(podIdentifier, groupID, meta)
-				podEntries[0].HasGroup = true
-				podEntries[0].GroupIdx = groupID
-				podEntries[0].AttentionKind = meta.Kind
-				podEntries[0].SlidingWindowSize = meta.SlidingWindowSize
+				entry.HasGroup = true
+				entry.GroupIdx = groupID
+				entry.AttentionKind = meta.Kind
+				entry.SlidingWindowSize = meta.SlidingWindowSize
 
 				// Masked (sparse) group stores: vLLM's reachable_block_mask
 				// (mixed-page-size hybrids, retention-interval checkpointing)
@@ -363,6 +363,7 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 					continue
 				}
 			}
+			podEntries := []kvblock.PodEntry{entry}
 
 			engineKeys := make([]kvblock.BlockHash, len(ev.BlockHashes))
 			for i, hash := range ev.BlockHashes {
@@ -461,18 +462,19 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			}
 
 			// Create PodEntry for this specific event's device tier.
-			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
+			entry := kvblock.PodEntry{PodIdentifier: podIdentifier, DeviceTier: deviceTier}
 			if ev.GroupIdx != nil {
 				groupID := kvblock.GroupID(*ev.GroupIdx)
-				podEntries[0].HasGroup = true
-				podEntries[0].GroupIdx = groupID
+				entry.HasGroup = true
+				entry.GroupIdx = groupID
 				// BlockRemoved carries only group_idx; rebuild the attention
 				// metadata from the catalog so the entry matches the stored one.
 				if meta, ok := p.groupCatalog.Get(podIdentifier, groupID); ok {
-					podEntries[0].AttentionKind = meta.Kind
-					podEntries[0].SlidingWindowSize = meta.SlidingWindowSize
+					entry.AttentionKind = meta.Kind
+					entry.SlidingWindowSize = meta.SlidingWindowSize
 				}
 			}
+			podEntries := []kvblock.PodEntry{entry}
 
 			// Iterate over the hashes and evict each key.
 			// The Index handles engine->request key resolution internally for both
