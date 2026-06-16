@@ -28,12 +28,13 @@ import (
 // BenchmarkLongestPrefixScorer tracks the scoring hot path: every routed
 // request pays one Score call. Scenarios:
 //
-//   - legacy: ungrouped entries, nil catalog — the non-HMA deployment; guards
-//     the phase-1 cost (prefix walk + prefix-sum bookkeeping).
+//   - legacy: ungrouped entries — the non-HMA deployment; guards the phase-1
+//     cost (prefix walk + prefix-sum bookkeeping).
 //   - hma_full_hit: hybrid entries, everything cached — phase 2 terminates
 //     after one trailing window; the common warm-cache HMA case.
-//   - hma_swa_absent: hybrid entries with the SWA group evicted — phase 2
-//     scans the entire prefix and collapses the hit; the worst-case scan.
+//   - hma_swa_absent: grouped entries with no sliding-window group present —
+//     phase 2 does not run, leaving the main-attention prefix; the grouped
+//     phase-1 cost without reduction.
 func BenchmarkLongestPrefixScorer(b *testing.B) {
 	const (
 		numPods   = 32
@@ -43,7 +44,7 @@ func BenchmarkLongestPrefixScorer(b *testing.B) {
 
 	scenarios := []struct {
 		name string
-		hma  bool // grouped entries + catalog
+		hma  bool // grouped entries
 		swa  bool // include sliding-window group entries
 	}{
 		{name: "legacy", hma: false},
@@ -65,25 +66,16 @@ func BenchmarkLongestPrefixScorer(b *testing.B) {
 				}
 				entries = append(entries, hmaEntry(pod, 0))
 				if sc.swa {
-					entries = append(entries, hmaEntry(pod, 1))
+					swa := hmaEntry(pod, 1)
+					swa.SlidingWindowSize = window
+					entries = append(entries, swa)
 				}
 			}
 			keyToPods[keys[i]] = entries
 		}
 
-		var catalog *kvblock.GroupCatalog
-		if sc.hma {
-			catalog = kvblock.NewGroupCatalog()
-			w := window
-			for p := 0; p < numPods; p++ {
-				pod := fmt.Sprintf("pod-%d", p)
-				catalog.Learn(pod, 0, kvblock.GroupMetadata{IsMainAttention: true, BlockSize: hmaTestBlockSize})
-				catalog.Learn(pod, 1, kvblock.GroupMetadata{BlockSize: hmaTestBlockSize, SlidingWindowSize: &w})
-			}
-		}
 		scorer := &kvcache.LongestPrefixScorer{
 			MediumWeights:      map[string]float64{"gpu": 1.0, "cpu": 0.5},
-			Catalog:            catalog,
 			CanonicalBlockSize: hmaTestBlockSize,
 		}
 

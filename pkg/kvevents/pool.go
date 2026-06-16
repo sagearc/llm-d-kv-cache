@@ -124,9 +124,17 @@ func NewPool(cfg *Config, index kvblock.Index, tokenProcessor kvblock.TokenProce
 	return p
 }
 
-// GroupCatalog returns the KV cache group metadata learned from events.
-func (p *Pool) GroupCatalog() *kvblock.GroupCatalog {
-	return p.groupCatalog
+// attentionKind maps a vLLM cache-spec kind onto the engine-agnostic
+// AttentionKind the index and scorer use.
+func attentionKind(k KVCacheSpecKind) kvblock.AttentionKind {
+	switch {
+	case k.IsMainAttention():
+		return kvblock.AttentionMain
+	case k.IsSlidingWindow():
+		return kvblock.AttentionSlidingWindow
+	default:
+		return kvblock.AttentionUnknown
+	}
 }
 
 // Start begins the worker pool.
@@ -326,18 +334,19 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
 			if ev.GroupIdx != nil {
 				groupID := kvblock.GroupID(*ev.GroupIdx)
-				// Classify the vLLM cache-spec kind into engine-agnostic group
-				// properties; the window is only meaningful for sliding-window groups.
-				meta := kvblock.GroupMetadata{
-					IsMainAttention: ev.KVCacheSpecKind.IsMainAttention(),
-					BlockSize:       ev.BlockSize,
+				// Classify the vLLM cache-spec kind into the engine-agnostic
+				// attention kind; the window is only meaningful for SWA groups.
+				meta := kvblock.GroupMetadata{Kind: attentionKind(ev.KVCacheSpecKind)}
+				if meta.Kind == kvblock.AttentionSlidingWindow && ev.KVCacheSpecSlidingWindowSize != nil {
+					meta.SlidingWindowSize = *ev.KVCacheSpecSlidingWindowSize
 				}
-				if ev.KVCacheSpecKind.IsSlidingWindow() {
-					meta.SlidingWindowSize = ev.KVCacheSpecSlidingWindowSize
-				}
+				// Stamp the entry and remember the group so a BlockRemoved (which
+				// lacks the kind/window) can be rebuilt into the same entry.
 				p.groupCatalog.Learn(podIdentifier, groupID, meta)
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = groupID
+				podEntries[0].AttentionKind = meta.Kind
+				podEntries[0].SlidingWindowSize = meta.SlidingWindowSize
 
 				// Masked (sparse) group stores: vLLM's reachable_block_mask
 				// (mixed-page-size hybrids, retention-interval checkpointing)
@@ -454,8 +463,15 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 			// Create PodEntry for this specific event's device tier.
 			podEntries := []kvblock.PodEntry{{PodIdentifier: podIdentifier, DeviceTier: deviceTier}}
 			if ev.GroupIdx != nil {
+				groupID := kvblock.GroupID(*ev.GroupIdx)
 				podEntries[0].HasGroup = true
-				podEntries[0].GroupIdx = kvblock.GroupID(*ev.GroupIdx)
+				podEntries[0].GroupIdx = groupID
+				// BlockRemoved carries only group_idx; rebuild the attention
+				// metadata from the catalog so the entry matches the stored one.
+				if meta, ok := p.groupCatalog.Get(podIdentifier, groupID); ok {
+					podEntries[0].AttentionKind = meta.Kind
+					podEntries[0].SlidingWindowSize = meta.SlidingWindowSize
+				}
 			}
 
 			// Iterate over the hashes and evict each key.

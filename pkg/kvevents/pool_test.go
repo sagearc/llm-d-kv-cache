@@ -687,12 +687,10 @@ func TestHMAGroupMetadataAndEntryOnBlockStored(t *testing.T) {
 	}
 	pool.processEventBatch(ctx, batch, "pod-hma", "test-model")
 
-	meta, ok := pool.GroupCatalog().Get("pod-hma", kvblock.GroupID(0))
+	meta, ok := pool.groupCatalog.Get("pod-hma", kvblock.GroupID(0))
 	require.True(t, ok)
-	assert.False(t, meta.IsMainAttention, "sliding-window group is not main attention")
-	assert.Equal(t, 16, meta.BlockSize)
-	require.NotNil(t, meta.SlidingWindowSize)
-	assert.Equal(t, 128, *meta.SlidingWindowSize)
+	assert.Equal(t, kvblock.AttentionSlidingWindow, meta.Kind, "sliding-window group is not main attention")
+	assert.Equal(t, 128, meta.SlidingWindowSize)
 
 	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
 	require.NoError(t, err)
@@ -866,10 +864,9 @@ func TestHMAMaskedGroupStoreSkipsIndexing(t *testing.T) {
 	pool.processEventBatch(ctx, batch, "pod-masked", "test-model")
 
 	// Group metadata is still learned from the event.
-	meta, ok := pool.GroupCatalog().Get("pod-masked", kvblock.GroupID(1))
+	meta, ok := pool.groupCatalog.Get("pod-masked", kvblock.GroupID(1))
 	require.True(t, ok)
-	require.NotNil(t, meta.SlidingWindowSize)
-	assert.Equal(t, 32, *meta.SlidingWindowSize)
+	assert.Equal(t, 32, meta.SlidingWindowSize)
 
 	// But no canonical key was indexed.
 	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
