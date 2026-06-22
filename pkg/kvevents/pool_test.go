@@ -836,27 +836,102 @@ func TestAllBlocksCleared_Dispatch(t *testing.T) {
 	}
 }
 
-// TestHMAMaskedGroupStoreSkipsIndexing verifies that a masked (sparse) group
-// store — token_ids spanning more blocks than block_hashes covers, as vLLM's
-// reachable_block_mask emits for mixed-page-size hybrids — learns group
-// metadata but is not indexed: re-chunking the full token span would fabricate
-// presence for blocks the engine never cached.
-func TestHMAMaskedGroupStoreSkipsIndexing(t *testing.T) {
+// hasGroup reports whether any pod entry carries the given group.
+func hasGroup(entries []kvblock.PodEntry, group kvblock.GroupID) bool {
+	for _, e := range entries {
+		if e.HasGroup && e.GroupIdx == group {
+			return true
+		}
+	}
+	return false
+}
+
+// TestHMAMaskedGroupStoreIndexesByContentIdentity verifies that a masked
+// (sparse) group store — token_ids spanning more blocks than block_hashes
+// covers, as vLLM emits under sliding-window retention — is recorded by content
+// identity rather than dropped. vLLM emits the sliding-window (group 0) store
+// before the dense full-attention (group 1) store within a batch; the pool
+// defers the masked store, lets the dense store establish the engine→request
+// key mapping, then resolves each kept block hash against it. The result mirrors
+// vLLM exactly: the SWA group is recorded only for the blocks it actually kept,
+// with no fabricated presence for the dropped blocks.
+func TestHMAMaskedGroupStoreIndexesByContentIdentity(t *testing.T) {
 	ctx := logging.NewTestLoggerIntoContext(context.Background())
 	pool, idx, tp := newTestPool(t, 16)
 
-	tokens := makeTokens(64)
-	engineKeys := makeEngineKeys(2, 900) // kept tail blocks only: 2*16 = 32 < 64 tokens
-	groupIdx := 1
+	tokens := makeTokens(64)             // 4 canonical blocks of 16 tokens
+	engineKeys := makeEngineKeys(4, 800) // content hashes, shared across groups
+	faGroup := 1                         // dense full-attention store
+	swaGroup := 0                        // masked sliding-window store
 	slidingWindow := 32
 
+	// Order the masked SWA store before the dense FA store, matching vLLM's
+	// per-batch emission order (group 0 cached before group 1).
 	batch := &EventBatch{
 		Events: []GenericEvent{
 			&BlockStoredEvent{
-				BlockHashes:                  engineKeys,
-				Tokens:                       tokens,
+				BlockHashes:                  engineKeys[2:], // only the last 2 blocks kept
+				Tokens:                       tokens,         // full span -> masked
 				ParentHash:                   0,
-				GroupIdx:                     &groupIdx,
+				GroupIdx:                     &swaGroup,
+				KVCacheSpecKind:              KVCacheSpecKindSlidingWindow,
+				KVCacheSpecSlidingWindowSize: &slidingWindow,
+				BlockSize:                    16,
+			},
+			&BlockStoredEvent{
+				BlockHashes:     engineKeys, // all 4 blocks, dense
+				Tokens:          tokens,
+				ParentHash:      0,
+				GroupIdx:        &faGroup,
+				KVCacheSpecKind: KVCacheSpecKindFullAttention,
+				BlockSize:       16,
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batch, "pod-masked", "test-model")
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, canonicalKeys, 4)
+
+	result, err := idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+
+	// Every block is present for full attention (group 1).
+	for i, ck := range canonicalKeys {
+		assert.Truef(t, hasGroup(result[ck], 1), "block %d must have full-attention group", i)
+	}
+	// The sliding-window group (group 0) is recorded ONLY for the 2 blocks vLLM
+	// kept — exactly mirroring engine state, with no fabricated presence.
+	assert.True(t, hasGroup(result[canonicalKeys[2]], 0), "kept block 2 must have SWA group")
+	assert.True(t, hasGroup(result[canonicalKeys[3]], 0), "kept block 3 must have SWA group")
+	assert.False(t, hasGroup(result[canonicalKeys[0]], 0), "dropped block 0 must not have SWA group")
+	assert.False(t, hasGroup(result[canonicalKeys[1]], 0), "dropped block 1 must not have SWA group")
+}
+
+// TestHMAMaskedGroupStore_SkipsWhenNoFAMapping verifies the safety half of the
+// content-identity contract: a masked (sparse) group store whose kept block
+// hashes have no prior full-attention store — so no engine->request mapping
+// exists to resolve them — indexes NOTHING. Presence is never fabricated for
+// blocks we cannot place (the SWA-only / full-attention-already-evicted case).
+func TestHMAMaskedGroupStore_SkipsWhenNoFAMapping(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+
+	tokens := makeTokens(64)             // 4 canonical blocks of 16 tokens
+	engineKeys := makeEngineKeys(4, 800) // content hashes
+	swaGroup := 0
+	slidingWindow := 32
+
+	// Only a masked SWA store — no full-attention store to establish the
+	// engine->request mapping the kept hashes would resolve against.
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes:                  engineKeys[2:], // 2 kept hashes
+				Tokens:                       tokens,         // full span -> masked
+				ParentHash:                   0,
+				GroupIdx:                     &swaGroup,
 				KVCacheSpecKind:              KVCacheSpecKindSlidingWindow,
 				KVCacheSpecSlidingWindowSize: &slidingWindow,
 				BlockSize:                    16,
@@ -865,21 +940,71 @@ func TestHMAMaskedGroupStoreSkipsIndexing(t *testing.T) {
 	}
 	pool.processEventBatch(ctx, batch, "pod-masked", "test-model")
 
-	// Group metadata is still learned from the event.
-	meta, ok := pool.GroupCatalog().Get("pod-masked", kvblock.GroupID(1))
-	require.True(t, ok)
-	require.NotNil(t, meta.SlidingWindowSize)
-	assert.Equal(t, 32, *meta.SlidingWindowSize)
-
-	// But no canonical key was indexed.
 	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
 	require.NoError(t, err)
-	require.NotEmpty(t, canonicalKeys)
+	require.Len(t, canonicalKeys, 4)
 
 	result, err := idx.Lookup(ctx, canonicalKeys, nil)
 	require.NoError(t, err)
-	for _, ck := range canonicalKeys {
-		assert.Empty(t, result[ck], "masked group store must not be indexed")
+	// Nothing indexed: the kept hashes have no request key to resolve against,
+	// so the masked store is skipped rather than invented.
+	for i, ck := range canonicalKeys {
+		assert.Emptyf(t, result[ck], "block %d must not be indexed without an FA mapping", i)
+	}
+}
+
+// TestHMAMaskedGroupStore_SingleBlockWindow verifies the fix is window-size
+// agnostic: a window of 17 (need = cdiv(17-1, 16) = 1) produces a masked store
+// with a single kept hash, which resolves by content identity exactly like the
+// 2-hash case. Only the one kept block gets the SWA group.
+func TestHMAMaskedGroupStore_SingleBlockWindow(t *testing.T) {
+	ctx := logging.NewTestLoggerIntoContext(context.Background())
+	pool, idx, tp := newTestPool(t, 16)
+
+	tokens := makeTokens(64)             // 4 canonical blocks of 16 tokens
+	engineKeys := makeEngineKeys(4, 800) // content hashes, shared across groups
+	faGroup := 1
+	swaGroup := 0
+	slidingWindow := 17 // need = cdiv(17-1, 16) = 1 -> a single kept block
+
+	batch := &EventBatch{
+		Events: []GenericEvent{
+			&BlockStoredEvent{
+				BlockHashes:                  engineKeys[3:], // 1 kept hash (the last block)
+				Tokens:                       tokens,         // full span -> masked
+				ParentHash:                   0,
+				GroupIdx:                     &swaGroup,
+				KVCacheSpecKind:              KVCacheSpecKindSlidingWindow,
+				KVCacheSpecSlidingWindowSize: &slidingWindow,
+				BlockSize:                    16,
+			},
+			&BlockStoredEvent{
+				BlockHashes:     engineKeys, // dense FA establishes the mapping
+				Tokens:          tokens,
+				ParentHash:      0,
+				GroupIdx:        &faGroup,
+				KVCacheSpecKind: KVCacheSpecKindFullAttention,
+				BlockSize:       16,
+			},
+		},
+	}
+	pool.processEventBatch(ctx, batch, "pod-masked", "test-model")
+
+	canonicalKeys, err := tp.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, "test-model", nil)
+	require.NoError(t, err)
+	require.Len(t, canonicalKeys, 4)
+
+	result, err := idx.Lookup(ctx, canonicalKeys, nil)
+	require.NoError(t, err)
+
+	// Every block has full attention.
+	for i, ck := range canonicalKeys {
+		assert.Truef(t, hasGroup(result[ck], 1), "block %d must have full-attention group", i)
+	}
+	// Only the single kept block (the last) has the sliding-window group.
+	assert.True(t, hasGroup(result[canonicalKeys[3]], 0), "kept block 3 must have SWA group")
+	for i := 0; i < 3; i++ {
+		assert.Falsef(t, hasGroup(result[canonicalKeys[i]], 0), "block %d must not have SWA group", i)
 	}
 }
 

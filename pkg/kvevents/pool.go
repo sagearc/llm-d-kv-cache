@@ -306,6 +306,11 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 		"modelName", modelName,
 		"eventCount", len(batch.Events))
 
+	// Masked (sparse) group stores are deferred to a second pass so the batch's
+	// dense full-attention stores (which establish the engine->request key
+	// mappings these resolve against) are applied first.
+	var deferredMasked []deferredMaskedStore
+
 	// Process each event in the batch
 	for _, genericEvent := range batch.Events {
 		switch ev := genericEvent.(type) {
@@ -339,18 +344,23 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 				podEntries[0].HasGroup = true
 				podEntries[0].GroupIdx = groupID
 
-				// Masked (sparse) group stores: vLLM's reachable_block_mask
-				// (mixed-page-size hybrids, retention-interval checkpointing)
-				// emits token_ids spanning the full block range while
-				// block_hashes covers only the kept tail blocks. Re-chunking
-				// those tokens would fabricate presence for spans the engine
-				// never cached, so skip indexing the event; group metadata
-				// above is still learned.
+				// Masked (sparse) group store: vLLM's reachable mask
+				// (sliding-window retention, mixed-page-size hybrids) emits
+				// token_ids for the full block range but block_hashes for
+				// only the blocks it actually kept cached. Re-chunking the
+				// full token span onto the sparse hashes would fabricate
+				// presence for the dropped blocks, so we cannot take the
+				// normal path. But the block hash is content-derived and
+				// group-independent: the same blocks are also written
+				// densely by the full-attention group in this batch, which
+				// maps each hash to its request key. Defer this store until
+				// the batch's dense stores have been applied, then resolve
+				// each kept hash by content identity (processDeferredMasked).
 				if len(ev.Tokens) > 0 && ev.BlockSize > 0 && len(ev.Tokens) != len(ev.BlockHashes)*ev.BlockSize {
-					debugLogger.Info("skipping masked group store: token span != hash span",
-						"podIdentifier", podIdentifier, "groupIdx", groupID,
-						"numTokens", len(ev.Tokens), "numHashes", len(ev.BlockHashes),
-						"blockSize", ev.BlockSize)
+					deferredMasked = append(deferredMasked, deferredMaskedStore{
+						ev:         ev,
+						podEntries: podEntries,
+					})
 					continue
 				}
 			}
@@ -495,5 +505,52 @@ func (p *Pool) processEventBatch(ctx context.Context, batch *EventBatch, podIden
 		default:
 			debugLogger.Info("Unknown event", "podIdentifier", podIdentifier, "event", genericEvent)
 		}
+	}
+
+	// Second pass: masked (sparse) group stores deferred above. The batch's
+	// dense full-attention stores are now applied, so each kept block hash
+	// resolves to its request key by content identity.
+	for _, d := range deferredMasked {
+		p.processDeferredMasked(ctx, d, podIdentifier)
+	}
+}
+
+// deferredMaskedStore is a masked group BlockStored event held back until the
+// batch's dense stores have populated the engine->request key mapping.
+type deferredMaskedStore struct {
+	ev         *BlockStoredEvent
+	podEntries []kvblock.PodEntry
+}
+
+// processDeferredMasked indexes a masked (sparse) group store by content
+// identity. vLLM emits token_ids for the full block range but block_hashes for
+// only the blocks it kept cached, and without their positions -- so we cannot
+// re-chunk tokens onto them. Instead we resolve each kept hash to the request
+// key established by the dense full-attention store of the same content block
+// (the block hash is group-independent). This records exactly the blocks vLLM
+// reported cached -- no positional guessing, no fabricated presence. A hash with
+// no known request key (its full-attention store was never seen or already
+// evicted) is skipped rather than invented.
+func (p *Pool) processDeferredMasked(ctx context.Context, d deferredMaskedStore, podIdentifier string) {
+	debugLogger := log.FromContext(ctx).V(logging.DEBUG)
+	engineKeys := make([]kvblock.BlockHash, 0, len(d.ev.BlockHashes))
+	requestKeys := make([]kvblock.BlockHash, 0, len(d.ev.BlockHashes))
+	for _, hash := range d.ev.BlockHashes {
+		engineKey := kvblock.BlockHash(hash)
+		requestKey, err := p.index.GetRequestKey(ctx, engineKey)
+		if err != nil {
+			debugLogger.Info("masked group store: no request key for kept block, skipping",
+				"podIdentifier", podIdentifier, "engineKey", engineKey)
+			continue
+		}
+		engineKeys = append(engineKeys, engineKey)
+		requestKeys = append(requestKeys, requestKey)
+	}
+	if len(requestKeys) == 0 {
+		return
+	}
+	if err := p.index.Add(ctx, engineKeys, requestKeys, d.podEntries); err != nil {
+		debugLogger.Error(err, "masked group store: failed to index kept blocks",
+			"podIdentifier", podIdentifier)
 	}
 }
